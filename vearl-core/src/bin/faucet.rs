@@ -1,5 +1,5 @@
 //! vearl-faucet --node HOST:PORT --wallet FAUCET.json [--listen 127.0.0.1:8081] [--amount 10] [--cooldown-secs 3600]
-//!              [--max-per-day 10000]
+//!              [--max-per-day 10000] [--state-file PATH]
 //! Wallet password: VEARL_WALLET_PASSWORD, or --password-file, or masked prompt. DEDICATED wallet.
 use vearl_core::faucet::{Faucet, FaucetConfig};
 use vearl_core::httpmini::serve;
@@ -22,9 +22,12 @@ fn password(args: &[String]) -> String {
 
 const HELP: &str = r#"vearl-faucet: a small service that gives test tokens to anyone who asks (testnet only).
 
-  vearl-faucet --node HOST:PORT --wallet FAUCET.json [--listen 127.0.0.1:8081] [--amount 10] [--cooldown-secs 3600] [--max-per-day 10000]
+  vearl-faucet --node HOST:PORT --wallet FAUCET.json [--listen 127.0.0.1:8081] [--amount 10] [--cooldown-secs 3600] [--max-per-day 10000] [--state-file PATH]
 
 Use a DEDICATED wallet. Its password is asked in the terminal, or given in VEARL_WALLET_PASSWORD or with --password-file FILE.
+Rate limits are persisted to --state-file (default: WALLET.faucet-state.json).
+Keep this file across restarts; its parent directory must exist and be writable.
+Reservations are saved before broadcast: failed/uncertain sends can consume quota.
 Details: docs/06."#;
 
 fn main() {
@@ -38,7 +41,8 @@ fn main() {
     let max_day = parse_amount(&arg(&args, "--max-per-day").unwrap_or_else(|| "10000".into())).unwrap_or_else(|e| die(&e));
     let ks = Keystore::load(std::path::Path::new(&wallet)).unwrap_or_else(|e| die(&e));
     let m = ks.unlock(&password(&args)).unwrap_or_else(|e| die(&e));
-    let faucet = Arc::new(Faucet::new(FaucetConfig { node, amount, cooldown: Duration::from_secs(cooldown), max_per_day: max_day }, derive_account(&m, 0)));
+    let state_file = arg(&args, "--state-file").unwrap_or_else(|| format!("{wallet}.faucet-state.json"));
+    let faucet = Arc::new(Faucet::persistent(FaucetConfig { node, amount, cooldown: Duration::from_secs(cooldown), max_per_day: max_day }, derive_account(&m, 0), &state_file).unwrap_or_else(|e| die(&e)));
     let f2 = faucet.clone();
     let bound = serve(&listen, move |req| f2.handle(req)).unwrap_or_else(|e| die(&format!("cannot listen: {e}")));
     eprintln!("[faucet] {} hands out {} VRL per request; listening on http://{bound}/", faucet.address(), fmt_amount(amount));
