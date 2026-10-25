@@ -190,6 +190,14 @@ pub enum Msg {
     RelayReply { id: u64, resp: Vec<u8> },
     /// Relay node -> client: encoded reply of the worker.
     RelayResponse { resp: Vec<u8> },
+    /// Like `GetOpsBox`, for a client that understands the compressed reply (rc25). A worker or a relay of an older release does not know it.
+    GetOpsBoxZ { job: JobId, ops: Vec<u8> },
+    /// The `BoxedOp`s of the requested operations, bincode then deflate (`pack_ops_z` / `unpack_ops_z`). The boxes are mostly repetitions: 40x or more.
+    OpsBoxZ(Vec<u8>),
+    /// Link test (rc25): the worker answers `Probe` with `bytes` bytes that do not compress (a stream derived from `nonce`), at most PROBE_MAX. A client
+    /// times it to know whether a miner can send the operations of a big job in reasonable time, directly or through a relay.
+    GetProbe { bytes: u32, nonce: u64 },
+    Probe(Vec<u8>),
 }
 
 /// Who a relayed request is for: a worker account, or the worker that holds a level 2 job.
@@ -206,14 +214,34 @@ const RELAY_MAX_PENDING: usize = 128;
 const RELAY_PER_ROUTE: usize = 64;
 /// Largest reply a relay node hands over (memory held for a client that does not read is bounded by pending requests x this).
 const RELAY_MAX_RESP: usize = 2 << 20;
+/// BULK relayed requests (jobs of an AI model that the miner holds in advance, docs/21 section 4 bis): the input of a job goes to the worker (`PutProgRef`:
+/// one n x n matrix of 1 MiB + the roots of the weights) and bounding boxes of operations come back (`GetOpsBox`, `GetOp`: at most OPS_BOX_BUDGET, or a
+/// full operation of 5 MiB). Both stay below MAX_MSG. Few of them at a time, because the seed carries every byte.
+pub const RELAY_MAX_REQ_BULK: usize = (1 << 20) + (64 << 10);
+pub const RELAY_MAX_RESP_BULK: usize = OPS_BOX_BUDGET + (1 << 20);
+/// A model block that is not in the miner's pack (the mean vector of a text depends on its length): at most this many blocks per relayed `PutModel`.
+pub const RELAY_MAX_PUT_BLOCKS: usize = 2;
+pub const RELAY_MAX_REQ_PUT: usize = 2 * (1 << 20) + (128 << 10);
+const RELAY_MAX_BULK: usize = 16;
+const RELAY_BULK_PER_ROUTE: usize = 4;
 const RELAY_TTL: Duration = Duration::from_secs(60);
 /// Requests a worker answers at the same time on behalf of relay nodes.
 const RELAY_SERVE_MAX: usize = 64;
 
-/// Only SMALL READ requests travel through a relay: the ones the audit of a level 2 job needs, whose replies are a few kilobytes. Nothing that
-/// writes (`Put*`, `NewTx`), nothing that relays again, nothing whose reply is a matrix (those need a direct connection).
+/// What travels through a relay: the small READ requests of the audit of a level 2 job (replies of a few kilobytes), and, for the jobs of an AI model
+/// that the miner holds in advance, the four requests of the client (`HasModel`, `PutProgRef`, `GetOpsBox`, `GetOp`: see `relay_is_bulk`). Nothing
+/// else that writes (`PutModel` would upload the weights, `NewTx`), nothing that relays again, no other matrix.
 pub fn relay_allowed(m: &Msg) -> bool {
-    matches!(m, Msg::GetL2(_) | Msg::GetL2Chunk { .. } | Msg::GetJob(_) | Msg::GetMlp(_) | Msg::GetProg(_) | Msg::GetTiled(_) | Msg::GetServed(_) | Msg::GetRep(_) | Msg::GetStatus)
+    matches!(m, Msg::GetL2(_) | Msg::GetL2Chunk { .. } | Msg::GetJob(_) | Msg::GetMlp(_) | Msg::GetProg(_) | Msg::GetTiled(_) | Msg::GetServed(_) | Msg::GetRep(_) | Msg::GetStatus | Msg::HasModel { .. })
+        || relay_is_bulk(m)
+}
+
+/// The relayed requests that carry a matrix (the input of a job, the outputs of operations): bigger limits, but counted separately and few at a time.
+pub fn relay_is_bulk(m: &Msg) -> bool {
+    match m {
+        Msg::PutModel { ws } => ws.len() <= RELAY_MAX_PUT_BLOCKS, // only the few blocks that a pack does not hold; the weights of a model never travel here
+        _ => matches!(m, Msg::PutProgRef { .. } | Msg::GetOpsBox { .. } | Msg::GetOpsBoxZ { .. } | Msg::GetOp { .. } | Msg::GetProbe { .. }),
+    }
 }
 
 /// What a worker signs to announce itself to a relay node.
@@ -232,6 +260,73 @@ pub struct BoxedOp {
 
 /// Maximum size of an `OpsBox` reply (below MAX_MSG, even with a full 5 MiB operation on top).
 pub const OPS_BOX_BUDGET: usize = 8 << 20;
+/// Largest link test a worker answers.
+pub const PROBE_MAX: u32 = 8 << 20;
+
+/// The bytes of a link test: a stream of `blake3` output, so that nothing compresses it.
+pub fn probe_bytes(bytes: u32, nonce: u64) -> Vec<u8> {
+    let mut buf = vec![0u8; bytes.min(PROBE_MAX) as usize];
+    let mut h = blake3::Hasher::new();
+    h.update(b"vearl/probe/v1");
+    h.update(&nonce.to_le_bytes());
+    h.finalize_xof().fill(&mut buf);
+    buf
+}
+
+/// `OpsBoxZ`: the boxes are limited BEFORE compression (a worker builds them in memory) and the reply AFTER it (it must go through a relay).
+pub const OPS_BOX_BUDGET_Z: usize = 48 << 20;
+/// A client refuses to inflate more than this (a bomb): a little more than the budget above.
+pub const OPS_BOX_Z_MAX_RAW: usize = 64 << 20;
+
+/// Boxes of the requested operations: the same prefix rule as `OpsBox`, with the byte budget of the caller.
+fn ops_box_items(tensors: &[Vec<i8>], zs: &[Option<Vec<i32>>], ops: &[u8], pn: usize, budget: usize) -> Option<Vec<BoxedOp>> {
+    if ops.is_empty() || ops.iter().any(|op| *op as usize >= zs.len()) {
+        return None;
+    }
+    let (mut items, mut bytes) = (vec![], 0usize);
+    for op in ops {
+        let (x_dims, x) = box_pack(&tensors[*op as usize + 1], pn);
+        let (z_dims, z) = match &zs[*op as usize] {
+            Some(z) => {
+                let (d, v) = box_pack(z, pn);
+                (Some(d), v)
+            }
+            None => (None, vec![]),
+        };
+        let sz = x.len() + 4 * z.len();
+        if !items.is_empty() && bytes + sz > budget {
+            break;
+        }
+        bytes += sz;
+        items.push(BoxedOp { x_dims, x, z_dims, z });
+    }
+    Some(items)
+}
+
+/// bincode + deflate of the boxes (see `Msg::OpsBoxZ`).
+pub fn pack_ops_z(items: &[BoxedOp]) -> Option<Vec<u8>> {
+    let raw = bincode::serialize(items).ok()?;
+    Some(miniz_oxide::deflate::compress_to_vec(&raw, 6))
+}
+
+/// Inverse of `pack_ops_z`; refuses more than `OPS_BOX_Z_MAX_RAW` bytes once inflated.
+pub fn unpack_ops_z(z: &[u8]) -> Option<Vec<BoxedOp>> {
+    let raw = miniz_oxide::inflate::decompress_to_vec_with_limit(z, OPS_BOX_Z_MAX_RAW).ok()?;
+    bincode::DefaultOptions::new().with_fixint_encoding().with_limit(OPS_BOX_Z_MAX_RAW as u64).deserialize(&raw).ok()
+}
+
+/// `OpsBoxZ` reply: as many of the requested operations as fit, after compression, in what a relay hands over.
+fn ops_box_reply_z(tensors: &[Vec<i8>], zs: &[Option<Vec<i32>>], ops: &[u8], pn: usize) -> Msg {
+    let mut budget = OPS_BOX_BUDGET_Z;
+    loop {
+        let Some(items) = ops_box_items(tensors, zs, ops, pn, budget) else { return Msg::Ack { ok: false, info: "no such operation".into() } };
+        match pack_ops_z(&items) {
+            Some(z) if z.len() <= RELAY_MAX_RESP_BULK - (1 << 20) => return Msg::OpsBoxZ(z),
+            _ if items.len() > 1 && budget > (1 << 20) => budget /= 2, // does not compress well: fewer operations per reply
+            _ => return Msg::Ack { ok: false, info: "reply too large".into() },
+        }
+    }
+}
 
 /// Bounding box (rows, columns) of the non-zero content of an n x n matrix stored row by row.
 pub fn nz_box<T: Copy + Default + PartialEq>(m: &[T], n: usize) -> (usize, usize) {
@@ -265,12 +360,44 @@ pub fn box_unpack<T: Copy + Default>(dims: (u32, u32), data: &[T], n: usize) -> 
     Some(m)
 }
 
+/// Workers (or relays) that did not understand `GetOpsBoxZ`: asked the old way from then on.
+static NO_ZBOX: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> = std::sync::LazyLock::new(|| Mutex::new(Default::default()));
+
+/// `request`, and again (a few times, with a short pause) while a relay node or a worker answers that it is busy: the relay only lets a few bulk
+/// requests through at a time, and a client that verifies a job in parallel has to wait its turn instead of failing.
+pub fn request_retry_busy(addr: &str, m: &Msg) -> io::Result<Msg> {
+    let mut tries = 0;
+    loop {
+        match request(addr, m) {
+            Ok(Msg::Ack { ok: false, info }) if tries < 60 && (info.contains("relay busy") || info.contains("worker busy")) => {
+                tries += 1;
+                thread::sleep(Duration::from_millis(150 + 25 * (tries.min(20) as u64)));
+            }
+            r => return r,
+        }
+    }
+}
+
 /// Outputs and Z of the operations `ops` of a program at the worker, in as few round trips as possible (bounding boxes);
 /// an old worker that does not know `GetOpsBox` is queried operation by operation (`GetOp`).
 pub fn fetch_ops(worker: &str, job: JobId, ops: &[u8], n: usize) -> Option<Vec<(Option<Vec<i32>>, Vec<i8>)>> {
     let mut out = Vec::with_capacity(ops.len());
     while out.len() < ops.len() {
-        match request(worker, &Msg::GetOpsBox { job, ops: ops[out.len()..].to_vec() }) {
+        // compressed reply first (40x or more smaller); a worker or a relay that does not know it is remembered and asked the old way
+        let zip_ok = !NO_ZBOX.lock().unwrap().contains(worker);
+        let reply = if zip_ok {
+            match request_retry_busy(worker, &Msg::GetOpsBoxZ { job, ops: ops[out.len()..].to_vec() }) {
+                Ok(Msg::OpsBoxZ(z)) => unpack_ops_z(&z).map(Msg::OpsBox).ok_or_else(|| ioerr("bad compressed reply")),
+                Ok(Msg::Ack { ok: false, info }) if info.contains("no such operation") => Ok(Msg::Ack { ok: false, info }),
+                Ok(_) | Err(_) => {
+                    NO_ZBOX.lock().unwrap().insert(worker.to_string());
+                    request_retry_busy(worker, &Msg::GetOpsBox { job, ops: ops[out.len()..].to_vec() })
+                }
+            }
+        } else {
+            request_retry_busy(worker, &Msg::GetOpsBox { job, ops: ops[out.len()..].to_vec() })
+        };
+        match reply {
             Ok(Msg::OpsBox(items)) if !items.is_empty() && items.len() <= ops.len() - out.len() => {
                 for b in items {
                     let x = box_unpack(b.x_dims, &b.x, n)?;
@@ -284,7 +411,7 @@ pub fn fetch_ops(worker: &str, job: JobId, ops: &[u8], n: usize) -> Option<Vec<(
             }
             _ => {
                 let op = ops[out.len()];
-                match request(worker, &Msg::GetOp { job, op }).ok()? {
+                match request_retry_busy(worker, &Msg::GetOp { job, op }).ok()? {
                     Msg::OpData { z, x } => out.push((z, x)),
                     _ => return None,
                 }
@@ -488,15 +615,49 @@ pub struct Node {
     relay_sk: Option<SigningKey>,
     /// Worker account -> peer id of its connection (relay node side).
     relay_routes: HashMap<PubKey, u64>,
+    /// What the relay node knows about each announced worker: where it can be dialed and whether a connection from here worked (see `relay_workers`).
+    relay_direct: HashMap<PubKey, RelayDirect>,
     /// Forwarded requests waiting for the worker's reply (relay node side).
     relay_pending: HashMap<u64, RelayPending>,
     relay_next: u64,
+}
+
+struct RelayDirect {
+    dial: Option<String>,
+    /// `Some(true)`: a TCP connection from this node to `dial` worked (the miner has a reachable address); `None`: not tested yet.
+    direct: Option<bool>,
+    since: u64,
 }
 
 struct RelayPending {
     client: SyncSender<Msg>,
     peer: u64,
     at: Instant,
+    /// a bulk request (see `relay_is_bulk`): its reply may be larger
+    bulk: bool,
+}
+
+/// A worker announced to this relay node: its account, where it can be dialed, and whether that worked from here (`/api/workers`).
+pub struct RelayWorker {
+    pub account: PubKey,
+    pub dial: Option<String>,
+    pub direct: Option<bool>,
+    pub seconds: u64,
+}
+
+pub fn relay_workers(sh: &Arc<Shared>) -> Vec<RelayWorker> {
+    let n = sh.node.lock().unwrap();
+    let now = now_secs();
+    let mut v: Vec<RelayWorker> = n
+        .relay_routes
+        .keys()
+        .map(|a| {
+            let d = n.relay_direct.get(a);
+            RelayWorker { account: *a, dial: d.and_then(|d| d.dial.clone()), direct: d.and_then(|d| d.direct), seconds: now.saturating_sub(d.map_or(now, |d| d.since)) }
+        })
+        .collect();
+    v.sort_by_key(|w| w.account);
+    v
 }
 
 /// Maximum number of weight blocks in a worker's registry (n = 1024: 1 MiB each).
@@ -939,6 +1100,7 @@ pub fn spawn_node(cfg: NodeConfig) -> io::Result<NodeHandle> {
             relay: false,
             relay_sk: if cfg.worker.is_some() { cfg.mine_key.clone() } else { None },
             relay_routes: HashMap::new(),
+            relay_direct: HashMap::new(),
             relay_pending: HashMap::new(),
             relay_next: 1,
         }),
@@ -1254,6 +1416,8 @@ fn peer_loop(sh: Arc<Shared>, stream: TcpStream, dialed: Option<String>) {
         n.peers.remove(&id);
         // relay node: the routes of this connection disappear, and the clients waiting on it are told at once
         n.relay_routes.retain(|_, p| *p != id);
+        let live: Vec<PubKey> = n.relay_routes.keys().copied().collect();
+        n.relay_direct.retain(|a, _| live.contains(a));
         let dead: Vec<u64> = n.relay_pending.iter().filter(|(_, p)| p.peer == id).map(|(k, _)| *k).collect();
         for k in dead {
             if let Some(p) = n.relay_pending.remove(&k) {
@@ -1353,9 +1517,10 @@ fn relay_request(sh: &Arc<Shared>, to: &RelayTo, req: &[u8], client: &SyncSender
     if !n.relay {
         return nack("this node is not a relay");
     }
-    if req.len() > RELAY_MAX_REQ || !decode_msg(req).map_or(false, |m| relay_allowed(&m)) {
-        return nack("request not relayable");
-    }
+    let bulk = match decode_msg(req) {
+        Ok(m) if relay_allowed(&m) && req.len() <= match m { Msg::PutProgRef { .. } => RELAY_MAX_REQ_BULK, Msg::PutModel { .. } => RELAY_MAX_REQ_PUT, _ => RELAY_MAX_REQ } => relay_is_bulk(&m),
+        _ => return nack("request not relayable"),
+    };
     let account = match to {
         RelayTo::Account(a) => *a,
         RelayTo::L2Job(id) => match n.chain.state.l2.get(id).map(|j| &j.status) {
@@ -1368,6 +1533,9 @@ fn relay_request(sh: &Arc<Shared>, to: &RelayTo, req: &[u8], client: &SyncSender
     if n.relay_pending.len() >= RELAY_MAX_PENDING || n.relay_pending.values().filter(|p| p.peer == pid).count() >= RELAY_PER_ROUTE {
         return nack("relay busy");
     }
+    if bulk && (n.relay_pending.values().filter(|p| p.bulk).count() >= RELAY_MAX_BULK || n.relay_pending.values().filter(|p| p.bulk && p.peer == pid).count() >= RELAY_BULK_PER_ROUTE) {
+        return nack("relay busy");
+    }
     let Some(ptx) = n.peers.get(&pid).map(|p| p.tx.clone()) else {
         n.relay_routes.remove(&account);
         return nack("no relay route to this worker");
@@ -1377,13 +1545,19 @@ fn relay_request(sh: &Arc<Shared>, to: &RelayTo, req: &[u8], client: &SyncSender
     if ptx.try_send(Msg::RelayForward { id, req: req.to_vec() }).is_err() {
         return nack("worker busy");
     }
-    n.relay_pending.insert(id, RelayPending { client: client.clone(), peer: pid, at: Instant::now() });
+    n.relay_pending.insert(id, RelayPending { client: client.clone(), peer: pid, at: Instant::now(), bulk });
 }
 
 /// WORKER: answers a forwarded request exactly as it would answer the same client directly.
 fn relay_serve(sh: &Arc<Shared>, req: &[u8]) -> Vec<u8> {
     let reply = match decode_msg(req) {
-        Ok(m) if relay_allowed(&m) => client_reply(sh, &m).unwrap_or(Msg::Ack { ok: false, info: "unsupported".into() }),
+        Ok(m) if relay_allowed(&m) => {
+            let reply = client_reply(sh, &m).unwrap_or(Msg::Ack { ok: false, info: "unsupported".into() });
+            if matches!(reply, Msg::Ack { ok: true, .. }) && matches!(m, Msg::PutProgRef { .. } | Msg::PutModel { .. }) {
+                persist_put(sh, &m); // the input of a job is kept as when the client puts it directly
+            }
+            reply
+        }
         _ => Msg::Ack { ok: false, info: "request not relayable".into() },
     };
     encode(&reply).or_else(|_| encode(&Msg::Ack { ok: false, info: "reply too large".into() })).unwrap_or_default()
@@ -1391,7 +1565,10 @@ fn relay_serve(sh: &Arc<Shared>, req: &[u8]) -> Vec<u8> {
 
 /// Replies to requests from clients that did not send a Hello (CLI).
 fn client_reply(sh: &Arc<Shared>, m: &Msg) -> Option<Msg> {
-    if let Msg::GetOpsBox { job, ops } = m {
+    if let Msg::GetProbe { bytes, nonce } = m {
+        return Some(Msg::Probe(probe_bytes(*bytes, *nonce)));
+    }
+    if let Msg::GetOpsBox { job, ops } | Msg::GetOpsBoxZ { job, ops } = m {
         // the operations of a program are borrowed under the lock (two Arcs) then boxed OUTSIDE the lock: the parallel
         // requests of a client no longer block the node (nor each other)
         let (run, pn) = {
@@ -1399,7 +1576,9 @@ fn client_reply(sh: &Arc<Shared>, m: &Msg) -> Option<Msg> {
             let run = if n.worker.map_or(false, |w| w.no_serve) { None } else { n.prog_runs.get(job).map(|r| (r.tensors.clone(), r.zs.clone())) };
             (run, n.chain.params.n)
         };
+        let zip = matches!(m, Msg::GetOpsBoxZ { .. });
         return Some(match run {
+            Some((tensors, zs)) if zip => ops_box_reply_z(&tensors, &zs, ops, pn),
             Some((tensors, zs)) => ops_box_reply(&tensors, &zs, ops, pn),
             None => Msg::Ack { ok: false, info: "no such operation".into() },
         });
@@ -1563,6 +1742,11 @@ fn on_msg_reply(sh: &Arc<Shared>, n: &mut Node, m: &Msg) -> Option<Msg> {
         Msg::GetOpsBox { job, ops } => Some(match n.prog_runs.get(job) {
             _ if n.worker.map_or(false, |w| w.no_serve) => Msg::Ack { ok: false, info: "no such operation".into() },
             Some(r) => ops_box_reply(&r.tensors, &r.zs, ops, n.chain.params.n),
+            _ => Msg::Ack { ok: false, info: "no such operation".into() },
+        }),
+        Msg::GetOpsBoxZ { job, ops } => Some(match n.prog_runs.get(job) {
+            _ if n.worker.map_or(false, |w| w.no_serve) => Msg::Ack { ok: false, info: "no such operation".into() },
+            Some(r) => ops_box_reply_z(&r.tensors, &r.zs, ops, n.chain.params.n),
             _ => Msg::Ack { ok: false, info: "no such operation".into() },
         }),
         Msg::PutTiled { a, b, dims } => {
@@ -1975,6 +2159,21 @@ fn on_msg(sh: &Arc<Shared>, n: &mut Node, id: u64, m: Msg) -> Result<(), String>
                 } else if n.relay_routes.len() < RELAY_MAX_ROUTES || n.relay_routes.contains_key(&account) {
                     n.relay_routes.retain(|_, p| *p != id); // one account per connection
                     n.relay_routes.insert(account, id);
+                    // can a connection from here reach the worker itself? (its address as seen by this node + the port it listens on)
+                    let dial = n.peers.get(&id).and_then(|p| {
+                        let port = p.listen.as_ref()?.rsplit(':').next()?.parse::<u16>().ok()?;
+                        Some(format!("{}:{port}", p.ip?))
+                    });
+                    n.relay_direct.insert(account, RelayDirect { dial: dial.clone(), direct: None, since: now_secs() });
+                    if let Some(d) = dial {
+                        let sh2 = sh.clone();
+                        thread::spawn(move || {
+                            let ok = d.parse::<std::net::SocketAddr>().ok().map_or(false, |a| TcpStream::connect_timeout(&a, Duration::from_secs(3)).is_ok());
+                            if let Some(e) = sh2.node.lock().unwrap().relay_direct.get_mut(&account) {
+                                e.direct = Some(ok);
+                            }
+                        });
+                    }
                     eprintln!("[relay] worker {} reachable through peer {id} ({} route(s))", crate::feeguard::hex(&account[..4]), n.relay_routes.len());
                 }
             }
@@ -1983,13 +2182,13 @@ fn on_msg(sh: &Arc<Shared>, n: &mut Node, id: u64, m: Msg) -> Result<(), String>
             // only the connection the request was sent down may answer it
             if n.relay_pending.get(&rid).map_or(false, |p| p.peer == id) {
                 if let Some(p) = n.relay_pending.remove(&rid) {
-                    let msg = if resp.len() > RELAY_MAX_RESP { Msg::Ack { ok: false, info: "reply too large for a relay".into() } } else { Msg::RelayResponse { resp } };
+                    let msg = if resp.len() > if p.bulk { RELAY_MAX_RESP_BULK } else { RELAY_MAX_RESP } { Msg::Ack { ok: false, info: "reply too large for a relay".into() } } else { Msg::RelayResponse { resp } };
                     let _ = p.client.try_send(msg);
                 }
             }
         }
         Msg::RelayRequest { .. } | Msg::RelayForward { .. } | Msg::RelayResponse { .. } => {}
-        Msg::Headers(_) | Msg::AccountProof { .. } | Msg::GetOpsBox { .. } | Msg::OpsBox(_) => {}
+        Msg::Headers(_) | Msg::AccountProof { .. } | Msg::GetOpsBox { .. } | Msg::OpsBox(_) | Msg::GetOpsBoxZ { .. } | Msg::OpsBoxZ(_) | Msg::GetProbe { .. } | Msg::Probe(_) => {}
         Msg::Status { .. } | Msg::Account { .. } | Msg::Ack { .. } | Msg::JobInfo { .. } | Msg::JobResult { .. } => {}
         Msg::PutJob { .. } | Msg::GetJob(_) | Msg::GetResult(_) | Msg::PutMlp { .. } | Msg::GetMlp(_) | Msg::GetLayer { .. } => {}
         Msg::MlpInfo { .. } | Msg::LayerData { .. } | Msg::Rep { .. } | Msg::GetRep(_) | Msg::GetServed(_) | Msg::Served { .. } => {}

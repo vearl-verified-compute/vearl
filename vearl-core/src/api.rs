@@ -158,6 +158,18 @@ fn status(sh: &Arc<Shared>) -> Response {
     )
 }
 
+/// The workers announced to this relay node (docs/21). Their addresses are not public: only a request from the machine itself gets the accounts and
+/// where each one can be dialed (the job service on the seed reads it); anybody else gets the count.
+fn workers(sh: &Arc<Shared>, req: &Request) -> Response {
+    let list = crate::net::relay_workers(sh);
+    let local = req.peer.parse::<std::net::IpAddr>().map_or(false, |ip| ip.is_loopback());
+    if !local {
+        return Response::json(200, &json!({ "count": list.len() }));
+    }
+    let items: Vec<Value> = list.iter().map(|w| json!({ "account": hex(&w.account), "dial": w.dial, "direct": w.direct, "seconds": w.seconds })).collect();
+    Response::json(200, &json!({ "count": list.len(), "workers": items }))
+}
+
 fn blocks(sh: &Arc<Shared>, q: &str) -> Response {
     let n = sh.node.lock().unwrap();
     let tip = n.chain.height();
@@ -686,6 +698,7 @@ pub fn route(sh: &Arc<Shared>, req: Request) -> Response {
             "/api/status" => status(sh),
             "/api/blocks" => blocks(sh, &req.query),
             "/api/mempool" => mempool(sh),
+            "/api/workers" => workers(sh, &req),
             "/api/jobs" => cached(sh, &req, jobs),
             "/api/miners" => cached(sh, &req, miners),
             "/api/accounts" => cached(sh, &req, accounts),

@@ -122,8 +122,8 @@ fn a_worker_nobody_can_dial_is_audited_through_the_seed() {
 
     // what writes, or relays again, does not travel
     let put = Msg::PutJob { a: vec![0; 4], b: vec![0; 4] };
-    // requests whose reply is a matrix do not travel either (they need a direct connection)
-    for big in [Msg::GetOp { job: id, op: 0 }, Msg::GetOpsBox { job: id, ops: vec![0] }, Msg::GetResult(id), Msg::GetTiledSum { job: id, i: 0, j: 0 }] {
+    // requests whose reply is a matrix do not travel either (they need a direct connection), except the ones of an AI job (see the last test)
+    for big in [Msg::GetResult(id), Msg::GetTiledSum { job: id, i: 0, j: 0 }, Msg::GetLayer { job: id, layer: 0 }, Msg::PutModel { ws: vec![vec![0; 4]; 3] }] {
         match request(&by_job, &big).unwrap() {
             Msg::Ack { ok: false, info } => assert!(info.contains("not relayable"), "{info}"),
             r => panic!("{r:?}"),
@@ -200,4 +200,138 @@ fn relay_address_syntax() {
     for bad in ["127.0.0.1:9000", "relay://host/l2:zz", "relay://host/xx:00", "relay://host", "relay://host/l2:abcd"] {
         assert_eq!(parse_relay_addr(bad), None, "{bad}");
     }
+}
+
+/// The requests of an AI job on a model that the miner holds in advance (docs/21 section 4 bis) travel through the relay: `HasModel`, the input of the job
+/// (`PutProgRef`, 1 MiB) and the reads of the outputs; uploading weights, or an input of the wrong size, does not.
+#[test]
+fn the_requests_of_an_ai_job_travel_through_the_relay() {
+    let n = genesis().params.n;
+    let dir = std::env::temp_dir().join(format!("vearl-relay-models-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let blocks: Vec<Vec<i8>> = (0..3).map(|k| (0..n * n).map(|i| (((i * 31 + k * 7) % 61) as i32 - 30) as i8).collect()).collect();
+    let mut f = Vec::new();
+    f.extend_from_slice(MODEL_PACK_MAGIC);
+    f.extend_from_slice(&(n as u32).to_le_bytes());
+    f.extend_from_slice(&2u32.to_le_bytes());
+    for b in &blocks[..2] {
+        f.extend(b.iter().map(|v| *v as u8));
+    }
+    std::fs::write(dir.join("m.vblocks"), f).unwrap();
+
+    let (seed, worker) = setup(true);
+    assert_eq!(worker.preload_models(dir.clone(), false).join().unwrap(), (2, 0));
+    wait("route", 30, || seed.relay_routes() == 1);
+    let acct = format!("relay://{}/acct:{}", seed.addr, hex32(&pubkey(&SigningKey::from_bytes(&[101; 32]))));
+    let roots: Vec<Hash> = blocks.iter().map(|b| vearl_core::work::rows_tree(b, n).root()).collect();
+
+    // has the miner the model?
+    match request(&acct, &Msg::HasModel { roots: roots.clone() }).unwrap() {
+        Msg::ModelHave { have } => assert_eq!(have, vec![true, true, false]),
+        m => panic!("{m:?}"),
+    }
+    // the input of a job (1 MiB through the seed) is accepted, like a direct put; an unknown block is refused by the WORKER (not by the relay)
+    let x0 = vec![1i8; n * n];
+    assert!(matches!(request(&acct, &Msg::PutProgRef { x0: x0.clone(), w_roots: roots[..2].to_vec() }).unwrap(), Msg::Ack { ok: true, .. }));
+    match request(&acct, &Msg::PutProgRef { x0: x0.clone(), w_roots: roots.clone() }).unwrap() {
+        Msg::Ack { ok: false, info } => assert!(info.contains("unknown model block"), "{info}"),
+        m => panic!("{m:?}"),
+    }
+    // and it is in the worker's store: the same call made directly says the same
+    assert!(matches!(request(&worker.addr, &Msg::PutProgRef { x0: x0.clone(), w_roots: roots[..2].to_vec() }).unwrap(), Msg::Ack { ok: true, .. }));
+    // reads of the outputs reach the worker (nothing has run, so it answers "no such operation": an answer of the worker, not a refusal of the relay)
+    for m in [Msg::GetOpsBox { job: [5; 32], ops: vec![0, 1] }, Msg::GetOpsBoxZ { job: [5; 32], ops: vec![0, 1] }, Msg::GetOp { job: [5; 32], op: 0 }] {
+        match request(&acct, &m).unwrap() {
+            Msg::Ack { ok: false, info } => assert!(!info.contains("not relayable"), "{info}"),
+            m => panic!("{m:?}"),
+        }
+    }
+    // what must not travel: the weights of a model (more than a couple of blocks), an input that is not 1 MiB-ish, a request that relays again
+    match request(&acct, &Msg::PutModel { ws: blocks.clone() }).unwrap() {
+        Msg::Ack { ok: false, info } => assert!(info.contains("not relayable"), "{info}"),
+        m => panic!("{m:?}"),
+    }
+    // ... but one block that the pack does not hold (the mean vector of a text of another length) can be put, and is then there
+    assert!(matches!(request(&acct, &Msg::PutModel { ws: vec![blocks[2].clone()] }).unwrap(), Msg::Ack { ok: true, .. }));
+    match request(&acct, &Msg::HasModel { roots: roots.clone() }).unwrap() {
+        Msg::ModelHave { have } => assert_eq!(have, vec![true; 3]),
+        m => panic!("{m:?}"),
+    }
+    let too_big = Msg::PutProgRef { x0: vec![1i8; 3 << 20], w_roots: roots[..2].to_vec() };
+    match request(&acct, &too_big).unwrap() {
+        Msg::Ack { ok: false, info } => assert!(info.contains("not relayable"), "{info}"),
+        m => panic!("{m:?}"),
+    }
+    // the bulk budget: two inputs in flight at once through one worker are fine, and the node keeps answering the small requests meanwhile
+    std::thread::scope(|s| {
+        for _ in 0..2 {
+            let (a, x, r) = (acct.clone(), x0.clone(), roots[..2].to_vec());
+            s.spawn(move || {
+                let reply = request(&a, &Msg::PutProgRef { x0: x, w_roots: r }).unwrap();
+                assert!(matches!(reply, Msg::Ack { ok: true, .. }) || matches!(&reply, Msg::Ack { info, .. } if info.contains("busy") || info.contains("store full")), "{reply:?}");
+            });
+        }
+        assert!(matches!(request(&acct, &Msg::GetStatus).unwrap(), Msg::Status { .. }));
+    });
+    worker.stop();
+    seed.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The compressed reply of operation outputs (`OpsBoxZ`): what the worker packs, the client unpacks, identically; a bomb or garbage is refused.
+#[test]
+fn compressed_operation_outputs_round_trip_and_a_bomb_is_refused() {
+    let n = 64usize;
+    // outputs the way a program has them: a box with repeated rows, mostly small values
+    let x: Vec<i8> = (0..n * 8).map(|i| ((i % 8) as i8) - 3).collect();
+    let z: Vec<i32> = (0..n * 8).map(|i| (i % 8) as i32 * 1000 - 3000).collect();
+    let items = vec![BoxedOp { x_dims: (8, n as u32), x: x.clone(), z_dims: Some((8, n as u32)), z: z.clone() }, BoxedOp { x_dims: (0, 0), x: vec![], z_dims: None, z: vec![] }];
+    let packed = pack_ops_z(&items).unwrap();
+    assert!(packed.len() * 4 < (x.len() + 4 * z.len()), "repetitive boxes shrink a lot ({} bytes)", packed.len());
+    let back = unpack_ops_z(&packed).unwrap();
+    assert_eq!(back.len(), 2);
+    assert_eq!((back[0].x.clone(), back[0].z.clone(), back[0].x_dims, back[0].z_dims), (x, z, (8, n as u32), Some((8, n as u32))));
+    assert!(back[1].x.is_empty() && back[1].z_dims.is_none());
+    // garbage, a truncated stream and a bomb (a huge run of zeros that inflates beyond the limit) are refused
+    assert!(unpack_ops_z(&[1, 2, 3, 4, 5]).is_none());
+    assert!(unpack_ops_z(&packed[..packed.len() / 2]).is_none());
+    let bomb = miniz_oxide::deflate::compress_to_vec(&vec![0u8; OPS_BOX_Z_MAX_RAW + 1024], 9);
+    assert!(bomb.len() < 200_000, "the bomb itself is small ({} bytes)", bomb.len());
+    assert!(unpack_ops_z(&bomb).is_none(), "refused instead of inflated");
+}
+
+/// The relay node knows which announced workers can also be dialed directly (`/api/workers`), and a link test goes through the relay and measures the
+/// miner's real link (bytes that do not compress).
+#[test]
+fn the_relay_lists_its_workers_and_a_link_test_goes_through_it() {
+    let (seed, worker) = setup(true);
+    wait("route", 30, || seed.relay_routes() == 1);
+    wait("the seed has tried to dial the worker", 30, || relay_workers(&seed.shared).first().map_or(false, |w| w.direct.is_some()));
+    let list = relay_workers(&seed.shared);
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].account, pubkey(&SigningKey::from_bytes(&[101; 32])));
+    assert_eq!(list[0].direct, Some(true), "a node listening on a reachable address is marked direct (here the loopback)");
+    assert_eq!(list[0].dial.as_deref(), Some(worker.addr.as_str()));
+
+    let acct = format!("relay://{}/acct:{}", seed.addr, hex32(&list[0].account));
+    for addr in [&acct, &worker.addr] {
+        match request(addr, &Msg::GetProbe { bytes: 3 << 20, nonce: 7 }).unwrap() {
+            Msg::Probe(v) => {
+                assert_eq!(v.len(), 3 << 20);
+                assert_eq!(v, probe_bytes(3 << 20, 7), "the same stream from both ends");
+                assert!(miniz_oxide::deflate::compress_to_vec(&v[..1 << 20], 6).len() > (1 << 20) * 9 / 10, "it does not compress: the test measures the link");
+            }
+            m => panic!("{m:?}"),
+        }
+    }
+    // asked for more than the maximum: the maximum (8 MiB goes through a relay)
+    match request(&acct, &Msg::GetProbe { bytes: u32::MAX, nonce: 1 }).unwrap() {
+        Msg::Probe(v) => assert_eq!(v.len(), PROBE_MAX as usize),
+        m => panic!("{m:?}"),
+    }
+    // the worker leaves: the entry goes with the route
+    worker.stop();
+    wait("route removed", 30, || relay_workers(&seed.shared).is_empty());
+    seed.stop();
 }

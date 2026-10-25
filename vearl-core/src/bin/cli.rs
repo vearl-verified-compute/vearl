@@ -143,6 +143,44 @@ fn run_cmd() {
     };
     match cmd {
         "status" => println!("{:?}", request(node, &Msg::GetStatus).expect("node")),
+        "probe" => {
+            // vearl-cli probe NODE WORKER [MB]: time a download of MB megabytes (default 4, at most 8) that does not compress, from a worker (a direct
+            // address or relay://SEED:PORT/acct:HEX); prints `PROBE bytes=... secs=... mbit=...`, what the routing of AI jobs uses
+            let mb: u32 = a.get(3).map_or(4, |v| v.parse().expect("MB"));
+            let bytes = mb.clamp(1, 8) << 20;
+            let t = std::time::Instant::now();
+            match request_retry_busy(&a[2], &Msg::GetProbe { bytes, nonce: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64) }) {
+                Ok(Msg::Probe(v)) if v.len() == bytes as usize => {
+                    let secs = t.elapsed().as_secs_f64().max(1e-6);
+                    println!("PROBE bytes={} secs={secs:.3} mbit={:.1}", v.len(), v.len() as f64 * 8.0 / 1e6 / secs);
+                }
+                other => println!("PROBE failed: {other:?}"),
+            }
+        }
+        "has-model" => {
+            // vearl-cli has-model NODE WORKER MODEL.json: how many weight blocks of the model the worker already holds (the packs installed in advance)
+            // the weight blocks are the base64 strings found under a "weights" key (a model written by a tool of tools/, or the template of MiniLM / BGE,
+            // whose operations depend on the length of the text), read the way tools/make_model_pack.py reads them
+            fn collect(v: &serde_json::Value, under: bool, out: &mut Vec<String>) {
+                match v {
+                    serde_json::Value::Object(o) => o.iter().for_each(|(k, x)| collect(x, under || k == "weights", out)),
+                    serde_json::Value::Array(l) => l.iter().for_each(|x| collect(x, under, out)),
+                    serde_json::Value::String(t) if under => out.push(t.clone()),
+                    _ => {}
+                }
+            }
+            let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(&a[3]).expect("model file")).expect("model json");
+            let mut strings = vec![];
+            collect(&doc, false, &mut strings);
+            let base: Vec<Vec<i8>> = strings.iter().filter_map(|t| vearl_core::model::b64_decode(t, p.n * p.n).ok()).collect();
+            let mut roots: Vec<Hash> = par_map_heavy(base.len(), |k| rows_tree(&base[k], p.n).root());
+            roots.sort();
+            roots.dedup();
+            match request_retry_busy(&a[2], &Msg::HasModel { roots: roots.clone() }) {
+                Ok(Msg::ModelHave { have }) if have.len() == roots.len() => println!("HASMODEL present={} total={}", have.iter().filter(|h| **h).count(), roots.len()),
+                other => println!("HASMODEL failed: {other:?}"),
+            }
+        }
         "balance" => {
             if let Msg::Account { balance, nonce, .. } = request(node, &Msg::GetAccount(parse_pk(&a[2]))).expect("node") {
                 println!("{} VRL (nonce {nonce})", balance as f64 / COIN as f64);
@@ -634,7 +672,8 @@ fn run_cmd() {
             };
             let t_start = std::time::Instant::now();
             // 1) worker model registry: the unknown weight blocks are sent only once for the whole series
-            let per_msg = ((12 << 20) / (p.n * p.n)).max(1);
+            // (through a relay only a couple of blocks go in one message, see `relay_is_bulk`: the weights of a model are meant to be installed in advance)
+            let per_msg = if workers.iter().any(|w| w.starts_with("relay://")) { RELAY_MAX_PUT_BLOCKS } else { ((12 << 20) / (p.n * p.n)).max(1) };
             let mut uniq: Vec<Hash> = vec![];
             let mut block_of: std::collections::HashMap<Hash, (usize, Option<usize>)> = Default::default();
             for (k, r) in base_roots.iter().enumerate() {
@@ -665,7 +704,7 @@ fn run_cmd() {
                 let missing: Vec<Vec<i8>> = uniq.iter().zip(&have).filter(|(_, h)| !**h).map(|(r, _)| block(r)).collect();
                 println!("worker {worker} registry: {}/{} weight blocks already present, {} sent once for the {} batches", have.iter().filter(|h| **h).count(), uniq.len(), missing.len(), last + 1 - first);
                 for part in missing.chunks(per_msg) {
-                    let r = request(worker, &Msg::PutModel { ws: part.to_vec() }).expect("worker");
+                    let r = request_retry_busy(worker, &Msg::PutModel { ws: part.to_vec() }).expect("worker");
                     assert!(matches!(r, Msg::Ack { ok: true, .. }), "weight deposit refused: {r:?}");
                 }
             }
@@ -702,7 +741,7 @@ fn run_cmd() {
                     }
                     assert!(matches!(r, Msg::Ack { ok: true, .. }), "Submit refused: {r:?}");
                     for worker in &workers {
-                        let r = request(worker, &Msg::PutProgRef { x0: x0.clone(), w_roots: w_roots.clone() }).expect("worker");
+                        let r = request_retry_busy(worker, &Msg::PutProgRef { x0: x0.clone(), w_roots: w_roots.clone() }).expect("worker");
                         assert!(matches!(r, Msg::Ack { ok: true, .. }), "input refused by {worker}: {r:?}");
                     }
                     escrow_total += per * gemms;
@@ -712,11 +751,12 @@ fn run_cmd() {
                 // ready batches (all operations published): verified IN PARALLEL, at most VERIFY_PAR at a time with FETCH_PAR requests
                 // each (VERIFY_PAR x FETCH_PAR connections: under the worker's incoming connection cap, MAX_IN); the transactions
                 // (Accept / Fraud) then go out in order, from this thread (sequential nonces)
-                const VERIFY_PAR: usize = 4;
-                const FETCH_PAR: usize = 4;
+                // through a relay (a miner at home) every byte goes through the seed: fewer requests at the same time
+                let relayed = workers.iter().any(|w| w.starts_with("relay://"));
+                let (verify_par, fetch_par) = if relayed { (2usize, 2usize) } else { (4usize, 4usize) };
                 let mut ready = vec![];
                 let mut k = 0;
-                while k < flying.len() && ready.len() < VERIFY_PAR {
+                while k < flying.len() && ready.len() < verify_par {
                     match request(node, &Msg::GetProg(flying[k].1)) {
                         Ok(Msg::ProgInfo { posted, total, .. }) if posted == total => {
                             let (idx, id, x0, ops, _) = flying.remove(k);
@@ -745,7 +785,7 @@ fn run_cmd() {
                     // operations in groups of OPS_PER_REQ in one round trip (bounding boxes), groups in parallel; roots in parallel
                     const OPS_PER_REQ: usize = 16;
                     let groups = ops.len().div_ceil(OPS_PER_REQ);
-                    let fetched: Vec<Result<Vec<(Option<Vec<i32>>, Vec<i8>)>, String>> = par_map_limit(groups, FETCH_PAR, |g| {
+                    let fetched: Vec<Result<Vec<(Option<Vec<i32>>, Vec<i8>)>, String>> = par_map_limit(groups, fetch_par, |g| {
                         let (lo, hi) = (g * OPS_PER_REQ, ((g + 1) * OPS_PER_REQ).min(ops.len()));
                         let t_net = std::time::Instant::now();
                         let want: Vec<u8> = (lo..hi).map(|o| o as u8).collect();

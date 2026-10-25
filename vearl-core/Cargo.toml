@@ -27,6 +27,8 @@ fips205 = "=0.4.1"
 # e-mail registration for the testnet rewards (docs/19): TLS client, pure Rust trust anchors; only used by `vearl-wallet register`
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 webpki-roots = { version = "0.26", optional = true }
+# deflate of the outputs of operations sent to a client (`GetOpsBoxZ`, docs/21 section 4 bis): pure Rust, no unsafe code; not used by consensus
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
 
 [[bin]]
 name = "devnet"
@@ -130,6 +132,10 @@ path = "src/bin/pool.rs"
 [[bin]]
 name = "vearl-poolminer"
 path = "src/bin/poolminer.rs"
+
+[[bin]]
+name = "vearl-release-sign"
+path = "src/bin/release_sign.rs"
 
 [[bin]]
 name = "vearl-pool-audit"

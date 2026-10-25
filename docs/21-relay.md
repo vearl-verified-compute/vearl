@@ -35,7 +35,7 @@ connection, so a seed that lies, drops or alters a reply can make an audit fail 
 | `RelayReply { id, resp }` | worker -> seed | the encoded reply |
 | `RelayResponse { resp }` | seed -> client | the encoded reply |
 
-Nothing in blocks, transactions, headers or the genesis changes: the genesis hash stays `46c57f50...`, a node of an older release keeps
+Nothing in blocks, transactions, headers or the genesis changes: the genesis hash stays `a5771be7...` (vearl-testnet-1), a node of an older release keeps
 working on the chain. Only the audit path gains a new route.
 
 ## 4. Rules and limits
@@ -56,6 +56,40 @@ working on the chain. Only the audit path gains a new route.
   carry the whole image once. Direct connections stay preferred: the gateway tries the relay first only because it answers at once when
   there is no route.
 - **When the worker disconnects**, its routes disappear and the clients waiting on it get "worker disconnected" immediately.
+
+## 4 bis. AI jobs through the relay (rc25)
+
+The AI jobs of the testnet (`vearl-cli infer`, the clients of ResNet-20, MiniLM, BGE-base, gpt, vit, Qwen3) talk to the worker, not only the chain:
+the client asks which model blocks the worker holds, puts the input of the job, and, once the worker has published its operations, fetches them
+to verify every one before paying. For a miner at home this needs the relay too, so a few more requests travel, all of them **bulk** (`relay_is_bulk`):
+
+| request | what | limit |
+|---|---|---|
+| `HasModel` | which weight blocks the worker already holds (a miner installs the packs in advance, `node --models-dir`) | small |
+| `PutProgRef` | the input of one job (n x n int8, 1 MiB) and the roots of its weights | request up to 1.1 MiB |
+| `PutModel` | **at most 2 blocks** that a pack does not hold (for MiniLM and BGE the mean vector of a text depends on its length) | request up to 2.1 MiB |
+| `GetOpsBox`, `GetOp` | the outputs of operations, as bounding boxes | reply up to 9 MiB |
+
+What still does not travel: the weights of a model (more than 2 blocks in a `PutModel`), `PutProg`/`PutProgMore`, `NewTx`, every other matrix.
+A relay node lets at most **16 bulk requests** through at the same time and **4 per worker** (`relay busy` otherwise; `vearl-cli` waits and asks again, and
+verifies 2 jobs and fetches 2 groups of operations at a time when the worker is behind a relay instead of 4 and 4). The worker applies the same rules
+and keeps the input it received like one put directly.
+
+**Compatibility.** No consensus change, no genesis change. A worker of an older release answers `request not relayable` to these requests, so a client
+that asks it through a relay simply does not get the model it wants and takes another worker; only workers of rc25 or later can be given an AI job
+through a relay. The seed must run rc25 as well.
+
+**What it costs (measured on a local network, resnet / minilm / bge files regenerated on 2026-10-24; every output identical to the independent engine).**
+The client verifies every operation, so it fetches every operation: that is the bandwidth of the worker as much as of the seed.
+
+| model | one job | to the worker | back from the worker |
+|---|---|---|---|
+| ResNet-20 (one photo) | 76 operations | 1 MiB | **3.6 MB** |
+| MiniLM-L6 (one text) | 195 operations | 1-2 MiB | **about 180 MB** |
+| BGE-base (one text) | 3 chained jobs, 492 operations | 1-2 MiB x 3 | **about 800 MB** |
+
+A miner at home with 30 Mbit/s of upload needs about a minute per MiniLM text and about four minutes per BGE text only to send the operations. This is
+not a relay limit (a direct connection carries the same bytes); it comes from verifying everything. See the options in the roadmap of the project.
 
 ## 5. Using it
 
