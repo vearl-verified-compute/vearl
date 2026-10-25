@@ -10,6 +10,10 @@
     {
       "address": "vrl1pjz76654u725l28d5krylnweyk0yay53cw5pdamsj9g0kqpp232qr5nucm",
       "amount": "1000000.00000000"
+    },
+    {
+      "address": "vrl1ppj9jh7p3nzlv5lv5qxle6de0pvaq3cnan9djkvj8a24tkud6plqkmspwd",
+      "amount": "0.00000001"
     }
   ],
   "timestamp": 1792771200,

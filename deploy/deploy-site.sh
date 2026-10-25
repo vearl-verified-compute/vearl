@@ -14,8 +14,8 @@
 #   complete but no job can be created. With --nginx --gw-live /gw/ is the real job gateway (deploy/gateway/) instead: use it only once the gateway runs on the public network.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-KEY="-i ${VEARL_SSH_KEY:-$HOME/.ssh/id_ed25519_vps_new} -o IdentitiesOnly=yes"   # override with VEARL_SSH_KEY
-HOST=${VEARL_SSH_HOST:-root@vearl.org}   # the web/seed server (override with VEARL_SSH_HOST)
+KEY="-i ${VEARL_SSH_KEY:-$HOME/.ssh/id_ed25519} -o IdentitiesOnly=yes"   # override with VEARL_SSH_KEY
+HOST=${VEARL_SSH_HOST:?set VEARL_SSH_HOST, for example root@your-server}   # the web/seed server (override with VEARL_SSH_HOST)
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 ARGS=" $* "

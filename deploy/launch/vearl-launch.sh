@@ -12,7 +12,7 @@
 set -u
 
 : "${LAUNCH_TS:=1792771200}"                    # 2026-10-23 16:00:00 UTC
-: "${GENESIS_HASH:=46c57f502a7d0685bde9db9afac81d0441693a69540e0d301619d5f78d41fb17}"
+: "${GENESIS_HASH:=a5771be72054adbfca6654cef5d4dbbcfb350655c3e901bfa2f5e626ada4b744}"
 : "${NODE_API:=127.0.0.1:8545}"                 # the node's read-only HTTP API
 : "${NODE_P2P:=127.0.0.1:9000}"                 # the node's peer port (wallet requests, loopback is never limited)
 : "${MIN_HEIGHT:=3}"                            # blocks needed before the wallet, the gateway and the faucet are started
