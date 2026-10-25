@@ -1032,8 +1032,27 @@ fn save_known(n: &Node) {
     }
 }
 
+/// `TcpListener::bind` asks the kernel for a queue of 128 connections waiting to be accepted. The seed of the public testnet overflowed it about
+/// five times a second (`TcpExtListenOverflows`): the kernel then drops the SYN and the client only retries a second later, a wallet or a miner
+/// that dials the seed sometimes waits for seconds. Asking again with a larger number is allowed on a listening socket (the kernel caps it at
+/// `net.core.somaxconn`).
+#[cfg(target_os = "linux")]
+fn raise_backlog(l: &TcpListener) {
+    use std::os::unix::io::AsRawFd;
+    extern "C" {
+        fn listen(fd: i32, backlog: i32) -> i32;
+    }
+    // SAFETY: `listen` on a valid listening socket owned by `l`; the result only matters as an optimisation
+    unsafe {
+        listen(l.as_raw_fd(), 4096);
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn raise_backlog(_: &TcpListener) {}
+
 pub fn spawn_node(cfg: NodeConfig) -> io::Result<NodeHandle> {
     let listener = TcpListener::bind(&cfg.listen)?;
+    raise_backlog(&listener);
     let addr = listener.local_addr()?.to_string();
     let mut chain = Chain::from_config(&cfg.genesis);
     let store = cfg.data_dir.as_ref().map(|d| {
@@ -1170,10 +1189,22 @@ pub fn spawn_node(cfg: NodeConfig) -> io::Result<NodeHandle> {
     // outgoing connections: cap MAX_OUT, never two outgoing peers in the same /16
     {
         let sh = shared.clone();
+        let mines = cfg.mine_key.is_some();
         thread::spawn(move || {
             let mut no_out_since: Option<Instant> = None;
             let mut warned = false;
+            let mut last_evict = Instant::now();
             while !sh.stop.load(Ordering::SeqCst) {
+                // The eviction of stuck transactions ran only in the mining loop. A node that does not mine (the seed, the node of a pool, a
+                // relay) kept for good the transactions that can no longer go through (a lost claim, an expired job), passed them on again and
+                // again, and refused every later transaction of their senders (`admit_tx` wants the nonce to follow the pending sequence):
+                // a worker whose claim had lost a race could not send anything any more (seen on the public testnet, 2026-10-25).
+                if !mines && last_evict.elapsed() >= Duration::from_secs(5) {
+                    last_evict = Instant::now();
+                    let mut n = sh.node.lock().unwrap();
+                    let ts = now_secs().max(n.chain.tip_ts() + 1);
+                    evict_stuck(&mut n, ts, &[0u8; 32]);
+                }
                 let (todo, mut out_ips, out_count, has_known) = {
                     let n = sh.node.lock().unwrap();
                     let mine = sh.listen.lock().unwrap().clone();
@@ -2663,7 +2694,9 @@ fn worker_step(n: &mut Node, sk: &SigningKey) -> Option<Target> {
     }
     // claims that lost the race (another worker took the job first) will never go through and would block every later transaction of this
     // worker (nonces) until the eviction of stuck transactions: when everything from the first lost claim on is a claim, drop it all at once,
-    // the jobs still open are claimed again with fresh nonces at the next turn
+    // the jobs still open are claimed again with fresh nonces at the next turn.
+    // Level 2 claims count too: with many workers racing for the same public jobs, a lost level 2 claim sat in front of the claims of the AI
+    // jobs (one nonce sequence per account) and nothing went through (seen on the public testnet, 2026-10-25).
     {
         let mut mine: Vec<(u64, bool, bool)> = n
             .mempool
@@ -2671,6 +2704,11 @@ fn worker_step(n: &mut Node, sk: &SigningKey) -> Option<Target> {
             .filter(|t| t.tx.from == me)
             .map(|t| match &t.tx.kind {
                 TxKind::Prog(ProgTx::Claim { job_id }) => (t.tx.nonce, true, !matches!(n.chain.state.progs.get(job_id).map(|j| &j.status), Some(ProgStatus::Open))),
+                TxKind::L2(crate::l2::L2Tx::Claim { job_id }) => (
+                    t.tx.nonce,
+                    true,
+                    !n.chain.state.l2.get(job_id).map_or(false, |j| j.claimable_at(&n.chain.state.timing, height, now)),
+                ),
                 _ => (t.tx.nonce, false, false),
             })
             .collect();

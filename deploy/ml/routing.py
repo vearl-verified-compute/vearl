@@ -143,6 +143,7 @@ class Router:
     def candidates(self, kind, units=1):
         """Workers that could still qualify and whose link or models are not known (fresh enough): measure these first."""
         t = self.now()
+        need = needed_mbit(kind, units)
         heavy = TRAFFIC_MB[kind] * max(1, units) > DIRECT_ONLY_MB
         out = []
         for w in list(self.workers.values()):
@@ -150,7 +151,7 @@ class Router:
                 continue
             if w.mbit is None or t - w.mbit_at > PROBE_TTL:
                 out.append(w)
-            else:
+            elif w.mbit >= need:
                 c = w.has.get(kind)
                 if not c or t - c[2] > HAS_MODEL_TTL:
                     out.append(w)

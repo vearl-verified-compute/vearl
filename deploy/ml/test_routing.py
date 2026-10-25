@@ -89,6 +89,18 @@ class RoutingTests(unittest.TestCase):
         self.assertIsNone(r.choose("resnet"))
         self.assertEqual(a.mbit, 0.0)
 
+    def test_dead_miners_do_not_use_up_the_budget_of_every_round(self):
+        # 31 miners that fail the probe sit in front of the good one: with a budget of 8 per call, the good one must still be reached after a few calls
+        dead = [R.Worker("d%02d" % i, direct=False) for i in range(31)]
+        good = R.Worker("zz", direct=False)
+        r = router(dead + [good], {"zz": 20.0}, {"zz": (10, 10)})
+        for _ in range(6):
+            r.choose("minilm")
+        self.assertIs(r.pick("minilm"), good)
+        before = [w.mbit_at for w in dead]
+        r.choose("minilm")
+        self.assertEqual(before, [w.mbit_at for w in dead], "a miner measured too slow is not probed again before its measure expires")
+
     def test_old_measures_are_not_trusted(self):
         a = R.Worker("aa", direct=False)
         r = router([a], {"aa": 50.0}, {"aa": (10, 10)})

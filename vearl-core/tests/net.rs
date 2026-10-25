@@ -368,6 +368,32 @@ fn spam_of_invalid_transactions_gets_the_peer_disconnected() {
 }
 
 #[test]
+fn a_node_that_does_not_mine_evicts_the_transactions_that_can_never_go_through() {
+    // A node that does not mine (the seed, the node of a pool, a relay) used to keep such a transaction for good, to pass it on again and again,
+    // and to refuse every later transaction of the sender (the nonce must follow the pending sequence): on the public testnet a worker whose
+    // claim had lost a race could not send anything any more.
+    let n = node(vec![], None);
+    let alice = SigningKey::from_bytes(&[100; 32]);
+    let nonce = match request(&n.addr, &Msg::GetAccount(pubkey(&alice))).unwrap() {
+        Msg::Account { next_nonce, .. } => next_nonce,
+        m => panic!("{m:?}"),
+    };
+    // admitted (signature, nonce and fee are fine) but it can never be applied: more than the balance
+    let impossible = SignedTx::new(Tx { from: pubkey(&alice), nonce, fee: 0, kind: TxKind::Transfer { to: [7u8; 32], amount: u64::MAX / 4 } }, &alice);
+    let after = SignedTx::new(Tx { from: pubkey(&alice), nonce: nonce + 1, fee: 0, kind: TxKind::Transfer { to: [7u8; 32], amount: 1 } }, &alice);
+    assert!(matches!(request(&n.addr, &Msg::NewTx(impossible)).unwrap(), Msg::Ack { ok: true, .. }));
+    assert!(matches!(request(&n.addr, &Msg::NewTx(after)).unwrap(), Msg::Ack { ok: true, .. }));
+    assert_eq!(n.shared.node.lock().unwrap().mempool.len(), 2);
+    // the same nonce again is refused while the first one is pending
+    let again = SignedTx::new(Tx { from: pubkey(&alice), nonce, fee: 0, kind: TxKind::Transfer { to: [8u8; 32], amount: 1 } }, &alice);
+    assert!(matches!(request(&n.addr, &Msg::NewTx(again.clone())).unwrap(), Msg::Ack { ok: false, .. }));
+    wait("the stuck transactions are evicted by a node that does not mine", 60, || n.shared.node.lock().unwrap().mempool.is_empty());
+    // and the sender is free again
+    assert!(matches!(request(&n.addr, &Msg::NewTx(again)).unwrap(), Msg::Ack { ok: true, .. }));
+    n.stop();
+}
+
+#[test]
 fn inbound_admission_limits_per_ip_and_per_subnet() {
     let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
     // two connections from the same IP: the 3rd is refused

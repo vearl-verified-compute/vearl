@@ -635,7 +635,7 @@ fn start_jobs_node(env: &Env, cfg: &Value, devnet: bool, gpu_ok: bool, address: 
 const MODELS_URL: &str = "https://github.com/vearl-verified-compute/vearl/releases/download/models-2/models.json";
 
 /// Current release tag, embedded at build time. Update this constant at each release.
-const MINER_TAG: &str = "rc25";
+const MINER_TAG: &str = "rc26";
 const UPDATE_URL: &str = "https://vearl.org/release/latest.json";
 /// Public key (64 hexadecimal digits) that signs `latest.json`, fixed at build time by the release secrets (`VEARL_UPDATE_PUBKEY`, the private key
 /// stays with the maintainer: `vearl-release-sign`). A build without it never updates itself, so a development build cannot be redirected.
