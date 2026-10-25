@@ -25,7 +25,7 @@ class Params:
     halflife_years: float = 2.0      # smooth exponential decay (PROVISIONAL)
     tail_emission_frac: float = 0.01  # floor = 1 % of reward0 (tail emission, PROVISIONAL)
     token_price_usd: float = 0.10
-    gpu_power_kw: float = 0.20        # ~ A10 under load (measured: ~151 W wildrig)
+    gpu_power_kw: float = 0.20        # ~ A10 under load (measured: ~151 W under a GPU miner)
     elec_usd_kwh: float = 0.10
     gpu_capex_usd_h: float = 0.15     # hardware depreciation per hour
     compute_price_usd_gpuh: float = 0.35  # client price per GPU-hour

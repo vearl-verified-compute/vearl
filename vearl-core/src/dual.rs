@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn parses_quoted_commands() {
-        assert_eq!(parse_cmd("srb --algo pearlhash --wallet \"a b\" -x 'c d'"), vec!["srb", "--algo", "pearlhash", "--wallet", "a b", "-x", "c d"]);
+        assert_eq!(parse_cmd("miner --algo example --wallet \"a b\" -x 'c d'"), vec!["miner", "--algo", "example", "--wallet", "a b", "-x", "c d"]);
         assert_eq!(parse_cmd("  one   two  "), vec!["one", "two"]);
         assert_eq!(parse_cmd("x \"\" y"), vec!["x", "", "y"]);
         assert!(parse_cmd("   ").is_empty());

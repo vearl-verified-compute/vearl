@@ -632,7 +632,14 @@ fn start_jobs_node(env: &Env, cfg: &Value, devnet: bool, gpu_ok: bool, address: 
 
 /// Where the model packs come from: the manifest (`models.json`) of the project's release; `--from` or VEARL_MODELS_URL name another source
 /// (a folder or an https address), for example a local mirror.
-const MODELS_URL: &str = "https://github.com/vearl-verified-compute/vearl/releases/download/models-1/models.json";
+const MODELS_URL: &str = "https://github.com/vearl-verified-compute/vearl/releases/download/models-2/models.json";
+
+/// Current release tag, embedded at build time. Update this constant at each release.
+const MINER_TAG: &str = "rc25";
+const UPDATE_URL: &str = "https://vearl.org/release/latest.json";
+/// Public key (64 hexadecimal digits) that signs `latest.json`, fixed at build time by the release secrets (`VEARL_UPDATE_PUBKEY`, the private key
+/// stays with the maintainer: `vearl-release-sign`). A build without it never updates itself, so a development build cannot be redirected.
+const UPDATE_PUBKEY: Option<&str> = option_env!("VEARL_UPDATE_PUBKEY");
 const MODELS_MAX_PACK: u64 = 8 << 30;
 
 fn sha256_file(p: &Path) -> io::Result<String> {
@@ -660,6 +667,178 @@ fn curl_get(url: &str, out: &Path, resume: bool) -> Result<(), String> {
         Ok(s) if s.success() => Ok(()),
         Ok(s) => Err(format!("download of {url} failed (curl exit code {})", s.code().unwrap_or(-1))),
         Err(e) => Err(format!("cannot run curl ({e}): download {url} by hand into the \"models\" folder")),
+    }
+}
+
+struct UpdateInfo {
+    tag: String,
+    bin_url: String,
+    sha256: String,
+}
+
+/// Detects the current platform key used in latest.json: "win64", "hiveos" or "linux64".
+/// HiveOS is Linux but gets its own entry so a HiveOS-specific bundle can be served if needed.
+fn detect_platform() -> &'static str {
+    if WINDOWS {
+        return "win64";
+    }
+    // HiveOS: the /hive directory always exists, and the env var is set by the flight sheet runner.
+    if std::path::Path::new("/hive").exists() || std::env::var("HIVE_WORKER_NAME").is_ok() {
+        return "hiveos";
+    }
+    "linux64"
+}
+
+/// Fetches latest.json (5-second timeout). Returns Some(info) when a newer binary is available
+/// for this platform, None if already up to date or the check fails (no network, etc.).
+fn fetch_update() -> Option<UpdateInfo> {
+    let pubkey = UPDATE_PUBKEY?;
+    let tmp = std::env::temp_dir().join("vearl_update_check.json");
+    let ok = Command::new("curl")
+        .args(["-fsSL", "--max-time", "5", "-o"])
+        .arg(&tmp)
+        .arg(UPDATE_URL)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_or(false, |s| s.success());
+    if !ok {
+        let _ = std::fs::remove_file(&tmp);
+        return None;
+    }
+    let body = std::fs::read_to_string(&tmp).ok();
+    let _ = std::fs::remove_file(&tmp);
+    manifest_update(body?.trim(), pubkey, MINER_TAG, detect_platform())
+}
+
+/// The update announced by a manifest, if there is one for `platform`, it is strictly newer than `current` and signed by `pubkey`.
+fn manifest_update(body: &str, pubkey: &str, current: &str, platform: &str) -> Option<UpdateInfo> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let tag = v["tag"].as_str()?.to_string();
+    // only a strictly newer tag: a validly signed OLD manifest replayed by someone must not bring a miner back to an older program
+    if !vearl_core::updatesig::is_newer(&tag, current) {
+        return None;
+    }
+    // Fall back to linux64 if the platform key is missing (e.g. hiveos not yet in the manifest).
+    let entry_name = if v[platform]["url"].is_string() { platform } else { "linux64" };
+    let entry = &v[entry_name];
+    let bin_url = entry["url"].as_str()?.to_string();
+    let sha256 = entry["sha256"].as_str()?.to_string();
+    if !(bin_url.starts_with("https://") && sha256.len() == 64) {
+        return None;
+    }
+    // the manifest must be signed by the Vearl release key: the hash next to the address would prove nothing if the server were compromised
+    if !vearl_core::updatesig::verify(pubkey, &vearl_core::updatesig::message(&tag, entry_name, &bin_url, &sha256), entry["sig"].as_str().unwrap_or("")) {
+        println!("[update] a newer release ({tag}) is announced but its manifest is not signed by the Vearl release key: ignored.");
+        return None;
+    }
+    Some(UpdateInfo { tag, bin_url, sha256 })
+}
+
+/// Downloads the update to a temp file, runs it in the same window, then deletes it on exit.
+/// The launcher (vearl-miner on disk) is NEVER modified: it stays at MINER_TAG permanently.
+/// Nothing persists after the session ends — the temp binary is always deleted.
+fn auto_update(info: UpdateInfo) {
+    let tmp_exe = std::env::temp_dir().join(if WINDOWS {
+        format!("vearl-run-{}.exe", std::process::id())
+    } else {
+        format!("vearl-run-{}", std::process::id())
+    });
+    let _ = std::fs::remove_file(&tmp_exe);
+
+    println!("[update] {} → {} — downloading...", MINER_TAG, info.tag);
+    let _ = io::stdout().flush();
+
+    if let Err(e) = curl_get(&info.bin_url, &tmp_exe, false) {
+        println!("[update] download failed: {e}");
+        let _ = std::fs::remove_file(&tmp_exe);
+        return;
+    }
+    match sha256_file(&tmp_exe) {
+        Ok(h) if h.eq_ignore_ascii_case(&info.sha256) => {}
+        Ok(_) => {
+            println!("[update] verification failed (SHA-256 mismatch). Cancelled.");
+            let _ = std::fs::remove_file(&tmp_exe);
+            return;
+        }
+        Err(e) => {
+            println!("[update] verification failed: {e}. Cancelled.");
+            let _ = std::fs::remove_file(&tmp_exe);
+            return;
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp_exe, std::fs::Permissions::from_mode(0o755));
+    }
+
+    println!("[update] starting {}...\n", info.tag);
+    let _ = io::stdout().flush();
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // The update binary runs from %TEMP%, so it cannot find network.json / node.exe on its own.
+    // Set current_dir to the launcher's directory (not --home: an update binary is not necessarily
+    // ours — it may be a self-contained third-party miner with its own CLI that chokes on an
+    // unrecognized flag — so we never inject arguments, only the working directory).
+    let launcher_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf()));
+
+    #[cfg(unix)]
+    {
+        // Set working dir to the launcher dir so config files are found by current-dir lookup too.
+        if let Some(ref dir) = launcher_dir {
+            let _ = std::env::set_current_dir(dir);
+        }
+        // Delete temp before exec: Linux keeps the inode open until the process exits, so the
+        // file disappears from the filesystem immediately but the binary keeps running normally.
+        let _ = std::fs::remove_file(&tmp_exe);
+        use std::os::unix::process::CommandExt;
+        let e = Command::new(&tmp_exe).args(&args).exec(); // replaces this process in-place
+        println!("[update] start failed: {e}");
+        // If exec failed the file is already deleted, nothing to clean up.
+    }
+    #[cfg(windows)]
+    {
+        // Spawn the update binary with the same console (same window). stdout is piped (not
+        // inherited) so we can drop its ASCII-art banner lines, if any, before they reach the
+        // screen; stdin/stderr stay inherited so real errors and prompts still pass through directly.
+        // Set current_dir so config files (miner.json etc.) are found by current-dir lookup too.
+        // Wait for it to finish, then delete the temp file: nothing is left on disk.
+        let mut cmd = Command::new(&tmp_exe);
+        cmd.args(&args).stdin(Stdio::inherit()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+        if let Some(ref dir) = launcher_dir {
+            cmd.current_dir(dir);
+        }
+        match cmd.spawn()
+        {
+            Ok(mut child) => {
+                if let Some(out) = child.stdout.take() {
+                    let mut reader = io::BufReader::new(out);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line) {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                // Decorative ASCII-art banner (box-drawing made of '#'): not useful information, drop it.
+                                if line.bytes().filter(|b| *b == b'#').count() < 10 {
+                                    print!("{line}");
+                                    let _ = io::stdout().flush();
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&tmp_exe);
+                std::process::exit(0);
+            }
+            Err(e) => {
+                println!("[update] start failed: {e}.");
+                let _ = std::fs::remove_file(&tmp_exe);
+            }
+        }
     }
 }
 
@@ -875,7 +1054,8 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |n: &str| args.iter().any(|a| a == n);
     if flag("--help") || flag("-h") {
-        println!("vearl-miner [setup | check | models | pool | solo] [--home DIR] [--devnet] [--mode pool|solo] [--pool HOST:PORT] [--address vrl1...] [--worker-name NAME] [--no-jobs] [--no-models]\n  (no argument)  start mining Vearl; the first time, an assistant asks how to mine (pool or solo), creates your Vearl wallet (and offers the optional Quantus add-on, if installed)\n  setup          run the assistant again\n  check          test the GPU, the network files, the Quantus add-on (if installed) and the pool, then stop\n  models         install or update the AI model packs now (otherwise done in the background at start): with them in place, clients send no model\n  --no-models    do not install or load the AI model packs in this run (they weigh about 650 MiB on disk and in memory)\n  pool | solo    switch the saved way of mining and start\n  --mode, --pool use that way of mining for this run only (--pool HOST:PORT implies pool mode; default pool {DEFAULT_POOL})\n  --address      with pool mode: mine to this Vearl address, no wizard and no settings file needed (HiveOS, scripts)\n  --no-jobs      pool mode: do not take paid jobs in this run (with a wallet, a worker node runs next to the pool miner)");
+        println!("vearl-miner [setup | check | models | pool | solo] [--home DIR] [--devnet] [--mode pool|solo] [--pool HOST:PORT] [--address vrl1...] [--worker-name NAME] [--no-jobs] [--no-models] [--no-update]\n  (no argument)  start mining Vearl; the first time, an assistant asks how to mine (pool or solo), creates your Vearl wallet (and offers the optional Quantus add-on, if installed)\n  setup          run the assistant again\n  check          test the GPU, the network files, the Quantus add-on (if installed) and the pool, then stop\n  models         install or update the AI model packs now (otherwise done in the background at start): with them in place, clients send no model\n  --no-update    do not look for a newer signed release at start (the check takes at most 5 seconds and is silent offline)
+  --no-models    do not install or load the AI model packs in this run (they weigh about 815 MiB on disk and in memory)\n  pool | solo    switch the saved way of mining and start\n  --mode, --pool use that way of mining for this run only (--pool HOST:PORT implies pool mode; default pool {DEFAULT_POOL})\n  --address      with pool mode: mine to this Vearl address, no wizard and no settings file needed (HiveOS, scripts)\n  --no-jobs      pool mode: do not take paid jobs in this run (with a wallet, a worker node runs next to the pool miner)");
         return;
     }
     // maintenance commands used by the release scripts (not shown in --help)
@@ -885,13 +1065,16 @@ fn main() {
         return;
     }
     for a in &args {
-        if a.starts_with("--") && !["--home", "--devnet", "--help", "--mode", "--pool", "--address", "--worker-name", "--no-jobs", "--no-models", "--from"].contains(&a.as_str()) {
+        if a.starts_with("--") && !["--home", "--devnet", "--help", "--mode", "--pool", "--address", "--worker-name", "--no-jobs", "--no-models", "--no-update", "--from"].contains(&a.as_str()) {
             die(&format!("unknown option {a}"));
         }
     }
     let opt = |n: &str| args.iter().position(|a| a == n).and_then(|i| args.get(i + 1)).filter(|v| !v.starts_with("--")).cloned();
     let home = args.iter().position(|a| a == "--home").and_then(|i| args.get(i + 1)).map(PathBuf::from).unwrap_or_else(|| {
-        std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf())).unwrap_or_else(|| PathBuf::from("."))
+        // Not the exe's own directory: when re-launched by the auto-updater from %TEMP%, the current
+        // working directory is set to the real install folder (see auto_update()), but the exe itself
+        // is not. Falling back to the exe's folder would wrongly resolve to %TEMP%.
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     });
     let devnet = flag("--devnet");
     let network = load_json(&home.join("network.json")).unwrap_or_else(|| {
@@ -917,6 +1100,12 @@ fn main() {
     };
 
     println!("Vearl miner (testnet \"{}\"): tokens have no value, not audited.\n", env.network["name"].as_str().unwrap_or("?"));
+    // Check and apply updates before anything else; if an update is installed this process exits and the new binary takes over.
+    if !devnet && !flag("--no-update") {
+        if let Some(info) = fetch_update() {
+            auto_update(info);
+        }
+    }
 
     if cmd == "models" {
         models_command(&env, opt("--from").as_deref());
@@ -1105,6 +1294,46 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vearl_core::updatesig::{message, public_key, sign};
+
+    const SEED: &str = "0707070707070707070707070707070707070707070707070707070707070707";
+    const SHA: &str = "b3bf025df9d9d387ca41823dd4df657efe7108cba0be13aeb9e56df5a0dc2175";
+
+    fn manifest(tag: &str, entries: &[(&str, &str)]) -> String {
+        let mut v = serde_json::json!({ "tag": tag });
+        for (name, url) in entries {
+            let sig = sign(SEED, &message(tag, name, url, SHA)).unwrap();
+            v[*name] = serde_json::json!({ "url": url, "sha256": SHA, "sig": sig });
+        }
+        v.to_string()
+    }
+
+    #[test]
+    fn only_a_newer_manifest_signed_by_the_release_key_is_an_update() {
+        let pk = public_key(SEED).unwrap();
+        let m = manifest("rc26", &[("win64", "https://vearl.org/release/a.exe"), ("linux64", "https://vearl.org/release/a")]);
+        let u = manifest_update(&m, &pk, "rc25", "win64").expect("signed and newer");
+        assert_eq!((u.tag.as_str(), u.bin_url.as_str(), u.sha256.as_str()), ("rc26", "https://vearl.org/release/a.exe", SHA));
+        // a HiveOS rig without its own entry uses the signed linux64 one
+        assert_eq!(manifest_update(&m, &pk, "rc25", "hiveos").unwrap().bin_url, "https://vearl.org/release/a");
+        // not newer: the same tag, an old signed manifest replayed
+        assert!(manifest_update(&m, &pk, "rc26", "win64").is_none());
+        assert!(manifest_update(&m, &pk, "rc27", "win64").is_none());
+        // signed by someone else
+        assert!(manifest_update(&m, &public_key(&"08".repeat(32)).unwrap(), "rc25", "win64").is_none());
+        // the file changed after the signature: other address, other hash, other tag, other platform entry
+        for (from, to) in [("https://vearl.org/release/a.exe", "https://evil.example/a.exe"), (SHA, &"0".repeat(64)), ("\"rc26\"", "\"rc99\"")] {
+            assert!(manifest_update(&m.replace(from, to), &pk, "rc25", "win64").is_none(), "{from}");
+        }
+        let swapped = serde_json::json!({ "tag": "rc26", "win64": serde_json::from_str::<serde_json::Value>(&m).unwrap()["linux64"].clone() }).to_string();
+        assert!(manifest_update(&swapped, &pk, "rc25", "win64").is_none(), "a signature of another platform entry is not valid for this one");
+        // no signature, plain http, junk
+        let unsigned = serde_json::json!({ "tag": "rc26", "win64": { "url": "https://vearl.org/a.exe", "sha256": SHA } }).to_string();
+        assert!(manifest_update(&unsigned, &pk, "rc25", "win64").is_none());
+        let http = manifest("rc26", &[("win64", "http://vearl.org/a.exe")]);
+        assert!(manifest_update(&http, &pk, "rc25", "win64").is_none());
+        assert!(manifest_update("not json", &pk, "rc25", "win64").is_none());
+    }
 
     #[test]
     fn pool_addresses_are_normalised() {

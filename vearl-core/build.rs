@@ -44,6 +44,7 @@ fn gen_fee_consts() {
 
 fn main() {
     gen_fee_consts();
+    println!("cargo:rerun-if-env-changed=VEARL_UPDATE_PUBKEY");
     println!("cargo:rerun-if-changed=gpu/vearl_gpu.cu");
     println!("cargo:rerun-if-changed=gpu/vearl_render2.cu");
     println!("cargo:rerun-if-changed=gpu/vearl_render3.cu");

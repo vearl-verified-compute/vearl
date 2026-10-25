@@ -59,8 +59,12 @@ What the miner does
                             compute the paid jobs that clients submit to the network (AI inference, rendering, linear algebra).
  * It mines Vearl only (the optional Quantus add-on aside): no other program runs on your machine.
  * Paid jobs: the AI models are installed in advance, so that a client never has to send a model. In the background at each start (solo, or
-   pool with a wallet) the miner downloads the model packs (about 650 MiB, from this project's GitHub release "models-1") into the "models"
+   pool with a wallet) the miner downloads the model packs (about 815 MiB, from this project's GitHub release "models-2") into the "models"
    folder and checks them; mining starts at once. "vearl-miner models" does it now, "vearl-miner --no-models" skips it for one run.
+ * Updates: at each start the miner looks (5 seconds, silently when offline) at https://vearl.org/release/latest.json. If a NEWER release is
+   announced AND its entry is signed by the Vearl release key built into this program, the miner downloads it to a temporary file, checks its
+   SHA-256, runs it in the same window and deletes it when you close the miner: nothing is installed and the files of this folder never change.
+   "vearl-miner --no-update" skips the check. An entry that is not signed, or not newer, is ignored.
  * You need an NVIDIA GPU of the Ampere generation or newer (RTX 30xx, 40xx, 50xx, A-series, L-series, H100...) and the NVIDIA driver
    ({driver}). Without a GPU the miner runs on the CPU, slowly.
  * The first start downloads the chain from the seed node and can take a few minutes. A status line is printed every 10 seconds
@@ -91,7 +95,7 @@ the folder, type cmd and press Enter; Linux: any terminal) and type a command. R
    vearl-wallet{exe} address --file wallet.json     (shows your address; the password is asked)
    vearl-wallet{exe} register --file wallet.json --contact "YOUR_DISCORD_NAME_OR_EMAIL"   (testnet rewards: signs your registration and, after you confirm, e-mails it to register@vearl.org)
 
-Files in this folder
+{genesis_note}Files in this folder
 --------------------
  vearl-miner{exe}        the program to open (everything else is started by it)
  node{exe}               the Vearl node
@@ -180,6 +184,17 @@ def licenses(dirpath):
     return out
 
 
+GENESIS_NOTE = """THE GENESIS FILE IS PUBLISHED AT THE LAUNCH
+---------------------------------------
+To keep the start of the network fair, the genesis file (genesis.json) is NOT in this archive: nobody can prepare blocks before the launch. It is published at
+16:00:00 UTC on 23 October 2026 at {url}.
+ * POOL mining (the default): nothing to do, the pool has it.
+ * SOLO mining, or paid jobs next to the pool: start-solo (or start-miner) downloads it by itself as soon as it exists; or save it as genesis.json in this
+   folder yourself. If you ran an earlier release in this folder, delete the "data" folder first: it belongs to another network.
+
+"""
+
+
 START_POOL_BAT = r"""@echo off
 rem Starts the Vearl miner in POOL mode (and remembers the choice).
 cd /d "%~dp0"
@@ -190,6 +205,15 @@ if errorlevel 1 pause
 START_SOLO_BAT = r"""@echo off
 rem Starts the Vearl miner in SOLO mode (and remembers the choice).
 cd /d "%~dp0"
+if not exist genesis.json (
+  echo Waiting for the launch: genesis.json is published at 16:00 UTC, it is downloaded here as soon as it exists...
+  :waitgenesis
+  curl.exe -fsS -o genesis.json.part GENESIS_URL >nul 2>nul && move /y genesis.json.part genesis.json >nul
+  if not exist genesis.json (
+    timeout /t 5 /nobreak >nul
+    goto waitgenesis
+  )
+)
 vearl-miner.exe solo %*
 if errorlevel 1 pause
 """
@@ -203,12 +227,17 @@ exec ./vearl-miner pool "$@"
 START_SOLO_SH = """#!/bin/sh
 # Starts the Vearl miner in SOLO mode (and remembers the choice).
 cd "$(dirname "$0")"
+if [ ! -s genesis.json ]; then
+  echo "Waiting for the launch: genesis.json is published at 16:00 UTC, it is downloaded here as soon as it exists..."
+  until curl -fsS -o genesis.json.part GENESIS_URL 2>/dev/null && mv genesis.json.part genesis.json; do sleep 5; done
+fi
 exec ./vearl-miner solo "$@"
 """
 
 START_BAT = r"""@echo off
 rem Starts the Vearl miner. First time: an assistant creates your Vearl wallet.
 cd /d "%~dp0"
+if not exist genesis.json curl.exe -fsS -o genesis.json.part GENESIS_URL >nul 2>nul && move /y genesis.json.part genesis.json >nul
 vearl-miner.exe %*
 if errorlevel 1 pause
 """
@@ -216,6 +245,7 @@ if errorlevel 1 pause
 START_SH = """#!/bin/sh
 # Starts the Vearl miner. First time: an assistant creates your Vearl wallet.
 cd "$(dirname "$0")"
+[ -s genesis.json ] || { curl -fsS -o genesis.json.part GENESIS_URL 2>/dev/null && mv genesis.json.part genesis.json; } || true
 exec ./vearl-miner "$@"
 """
 
@@ -258,6 +288,7 @@ def main():
     ap.add_argument("--linux", required=True)
     ap.add_argument("--windows", required=True)
     ap.add_argument("--genesis")
+    ap.add_argument("--genesis-at-launch", metavar="URL", help="the genesis file is NOT in the archives: network.json still names genesis.json, the README and the start scripts say where it is published at the launch instant (URL)")
     ap.add_argument("--peer", action="append", default=[], help="HOST:PORT@PUBLIC_KEY of a seed node, written into network.json (repeat for several: e.g. the domain name, then the IP)")
     ap.add_argument("--network", default="vearl-testnet-1")
     ap.add_argument("--pool", default="pool.vearl.org:3333", help="HOST:PORT of the official pool, written into network.json (vearl-miner pool mode)")
@@ -269,7 +300,7 @@ def main():
     sums = []
     gen = open(a.genesis, "rb").read() if a.genesis else None
     peer = a.peer[0] if a.peer else "SEED_HOST:9000@SEED_PUBLIC_KEY"
-    network = {"name": a.network, "genesis": "genesis.json" if gen else None, "peers": list(a.peer), "listen": "0.0.0.0:9000", "pool": a.pool}
+    network = {"name": a.network, "genesis": "genesis.json" if (gen or a.genesis_at_launch) else None, "peers": list(a.peer), "listen": "0.0.0.0:9000", "pool": a.pool}
     net_json = (json.dumps(network, indent=2) + "\n").encode()
     lic = licenses(a.licenses)
     date = time.strftime("%Y-%m-%d", time.gmtime())
@@ -281,10 +312,14 @@ def main():
         adv = "vearl-miner setup (run the assistant again), vearl-miner check (test GPU, files and pool), vearl-miner pool / solo (switch), miner.json (settings)."
         wallet_start = "Double-click it to open it." if win else "Run ./vearl-wallet-gui from a desktop session (it needs a graphical desktop with OpenGL; on a server use the command-line vearl-wallet)."
         wallet_dir = r"%APPDATA%\Vearl\wallets" if win else "~/.local/share/vearl/wallets"
-        return README.format(version=a.version, date=date, exe=".exe" if win else "", pool=a.pool, start_here=start, driver=driver, advanced=adv, wallet_start=wallet_start, wallet_dir=wallet_dir).encode()
+        note = GENESIS_NOTE.format(url=a.genesis_at_launch) if a.genesis_at_launch else ""
+        return README.format(genesis_note=note, version=a.version, date=date, exe=".exe" if win else "", pool=a.pool, start_here=start, driver=driver, advanced=adv, wallet_start=wallet_start, wallet_dir=wallet_dir).encode()
 
     def readme_addon(win):
         return README_ADDON.format(version=a.version, date=date, exe=".exe" if win else "", dev_address=DEV_ADDRESS).encode()
+
+    def start_script(text):
+        return text.replace("GENESIS_URL", a.genesis_at_launch or "https://vearl.org/genesis.json")
 
     built = {}
     for plat, d, win, ext in (("linux", a.linux, False, "tar.gz"), ("windows", a.windows, True, "zip")):
@@ -293,11 +328,11 @@ def main():
         path = os.path.join(a.out, f"{top}-{plat}-x86_64.{ext}")
         extra = [("README.txt", readme(win), 0o644), ("network.json", net_json, 0o644)]
         if win:
-            extra.append(("start-miner.bat", START_BAT.replace("\n", "\r\n").encode(), 0o755))
+            extra.append(("start-miner.bat", start_script(START_BAT).replace("\n", "\r\n").encode(), 0o755))
             extra.append(("start-pool.bat", START_POOL_BAT.replace("\n", "\r\n").encode(), 0o755))
-            extra.append(("start-solo.bat", START_SOLO_BAT.replace("\n", "\r\n").encode(), 0o755))
+            extra.append(("start-solo.bat", start_script(START_SOLO_BAT).replace("\n", "\r\n").encode(), 0o755))
         else:
-            extra += [("start-miner.sh", START_SH.encode(), 0o755), ("start-pool.sh", START_POOL_SH.encode(), 0o755), ("start-solo.sh", START_SOLO_SH.encode(), 0o755),
+            extra += [("start-miner.sh", start_script(START_SH).encode(), 0o755), ("start-pool.sh", START_POOL_SH.encode(), 0o755), ("start-solo.sh", start_script(START_SOLO_SH).encode(), 0o755),
                       ("start-node.sh", START_NODE_SH.format(peer=peer).encode(), 0o755)]
         if gen:
             extra.append(("genesis.json", gen, 0o644))
