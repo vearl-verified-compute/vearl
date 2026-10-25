@@ -9,6 +9,8 @@ OUT=/var/www/vearl-rewards
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 ARGS=(--node 127.0.0.1:8545 --start "$START" --out "$TMP" --dump-blocks)
+# the team can leave the first minutes of the testnet out of the score (docs/19): echo 30 > /etc/vearl/rewards-grace-minutes (absent: all blocks count)
+[ -s /etc/vearl/rewards-grace-minutes ] && ARGS+=(--grace-minutes "$(tr -dc 0-9 < /etc/vearl/rewards-grace-minutes)")
 # registered addresses: the list made by the registration processor (docs/19, vearl-register.timer), or a hand-made file
 if [ -s /var/lib/vearl-register/rewards-registered.json ]; then
   ARGS+=(--registered /var/lib/vearl-register/rewards-registered.json)

@@ -90,20 +90,20 @@ def join_label_lines(text):
 
 def unwrap_message(text):
     """Mail programs (Gmail, phones) cut the long message line into several lines: put them back together with a space, up to the end
-    of the message (`docs/19.`). Only the message line is touched."""
+    of the message (`docs/19.`), and runs of blanks become one space. Only the message line is touched."""
     lines = text.splitlines()
     out, i = [], 0
     while i < len(lines):
         t = lines[i].strip()
         starts = re.match(r"^(message:[ \t]*)?" + re.escape(MESSAGE_START), t, re.I)
-        if starts and not t.endswith("docs/19."):
+        if starts:
             j = i + 1
             while j < len(lines) and j <= i + 4 and not t.endswith("docs/19."):
                 if lines[j].strip():          # a blank line inside the message (Proton Mail) adds nothing, not a second space
                     t = t + " " + lines[j].strip()
                 j += 1
             if t.endswith("docs/19."):
-                out.append(t)
+                out.append(re.sub(r"\s+", " ", t))   # some programs double a space inside the line: the signed text has single spaces
                 i = j
                 continue
         out.append(lines[i])

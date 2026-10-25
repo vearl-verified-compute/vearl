@@ -28,9 +28,11 @@ result):
 | rule | value |
 |---|---|
 | a valid block mined to your address | 1 point |
-| a block that carried **paid work** (a job from a client) | 1.5 points |
+| a block that carried **paid work** (a job from a client) | 1.5 points, with three limits: not for a job the miner submitted itself (its own client), at most 20 blocks of one job, and the same operation, layer or product of a job only once. Such a block is a valid block and counts 1 point |
 | early period: the first 3 days after the start | points ×1.25 |
 | scoring periods | days, for the daily leaderboard; the final score is the sum |
+
+If the team finds that the start of the chain was gamed (for example blocks mined in advance and released at the launch), it may leave the first minutes out of the score (`--grace-minutes`) and will say so publicly.
 
 The leaderboard (<https://vearl.org/leaderboard/>) is refreshed regularly. It is built from the public files `leaderboard.json`,
 `leaderboard.csv` and `blocks.json` (the blocks used, with their SHA-256): you can download the blocks and re-run the same script to get

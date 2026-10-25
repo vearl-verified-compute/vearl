@@ -132,6 +132,19 @@ class ProcessTests(unittest.TestCase):
         r = b.run()
         self.assertEqual((r["added"], r["dropped"], r["total"]), (1, 1, 1))
 
+    def test_a_doubled_space_inside_the_message_is_accepted(self):
+        b = Box()
+        # Gmail on a phone: a space inside the line is doubled and the message is cut in three (a real mail of 2026-10-24)
+        wrapped = MSG1.replace(" Address: ", " Address:\r\n").replace(". Contact: ", ". Contact:\r\n").replace("I accept the", "I accept  the")
+        body = f"  address:   {ADDR1}\r\n  message:   {wrapped}\r\n  signature:\r\n{SIG1}\r\n"
+        head = "From: someone@gmail.com\r\nTo: register@vearl.org\r\nSubject: Vearl testnet registration\r\nDate: Fri, 23 Oct 2026 16:05:00 +0000\r\n"
+        raw = (head + "MIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n" + body).encode()
+        b.put(raw)
+        b.put(raw.replace(SIG1.encode(), SIG2.encode()))                                # forged: still refused
+        b.put(raw.replace(b"I accept  the", b"I accept  all"))                          # another text: still refused
+        r = b.run()
+        self.assertEqual((r["added"], r["dropped"], r["total"]), (1, 2, 1))
+
     def test_unlabelled_lines_do_not_let_a_forged_signature_through(self):
         b = Box()
         b.put(unlabelled_mail(ADDR1, MSG1, SIG2))                                  # the signature of another key

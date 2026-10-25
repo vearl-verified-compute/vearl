@@ -572,7 +572,10 @@ pub fn audit_pool(cfg: &AuditCfg, inp: &AuditInput) -> AuditReport {
         if listed >= 8 && orphans * 3 > listed {
             add(None, Severity::Suspect, "many_orphans", format!("{orphans} of the {listed} blocks the pool lists are not on the chain (more than a third)"));
         }
-        // every block of the pool on the chain must be listed in some document; the pool has until the deadline to publish the epoch it was found in
+        // every PPLNS block of the pool on the chain must be listed in some document; the pool has until the deadline to publish the epoch it
+        // was found in. A block mined through a SOLO port under the same pool address (a legitimate, common setup: ours included) is on chain
+        // under this address too but is never in the PPLNS ledger by design, so this cannot be told apart from real hiding with chain data
+        // alone: Suspect (a human checks with the pool), not Fraud.
         for b in mine {
             if seen.contains(&b.height) {
                 continue;
@@ -581,9 +584,9 @@ pub fn audit_pool(cfg: &AuditCfg, inp: &AuditInput) -> AuditReport {
             if cfg.now < b.timestamp + cfg.publish_deadline {
                 add(Some(epoch), Severity::Info, "block_pending", format!("block {}: not in a published ledger yet (still within the deadline)", b.height));
             } else if good.values().any(|d| u_field(d, "end").unwrap() > b.timestamp) {
-                add(Some(epoch), Severity::Fraud, "hidden_block", format!("block {} of this pool is on the chain but in none of its signed ledgers, although later ledgers were published", b.height));
+                add(Some(epoch), Severity::Suspect, "hidden_block", format!("block {} of this pool is on the chain but in none of its signed ledgers, although later ledgers were published (or it was mined through a solo port under the same address, which is never in the PPLNS ledger)", b.height));
             } else {
-                add(Some(epoch), Severity::Fraud, "undocumented_block", format!("block {} has no signed ledger and its publication deadline has passed", b.height));
+                add(Some(epoch), Severity::Suspect, "undocumented_block", format!("block {} has no signed ledger and its publication deadline has passed (or it was mined through a solo port under the same address, which is never in the PPLNS ledger)", b.height));
             }
         }
     }

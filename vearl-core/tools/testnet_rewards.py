@@ -9,7 +9,8 @@ with their SHA-256: anybody can publish or download such a file and re-run the c
 result. Nothing else than the blocks is used, so the score of a miner cannot be inflated off-chain.
 
 Score: 1 point per valid block mined to the address, 1.5 for a block that carried paid work (a job of a client), multiplied by 1.25 during
-the first three days. The blocks of a registered mining pool (--pools) are shared between the pool's miners in proportion to their verified work
+the first three days. The 1.5 is not paid for a job the miner submitted itself (client = miner), for more than 20 blocks of one job, nor twice for
+the same operation, layer or product of a job (a job that nobody else wants cannot be farmed). The blocks of a registered mining pool (--pools) are shared between the pool's miners in proportion to their verified work
 (tools/pool_points.py). Eligibility: at least 3 distinct active days (24-hour windows since the start), a minimum share of all the points,
 a registered address if a registration list is given, and not on the exclusion list. The reward pool is shared between the eligible
 addresses in proportion to their points. All parameters are printed in the output and can be changed with the options below.
@@ -39,6 +40,8 @@ DEFAULTS = {
     "early_days": 3,          # the first days get a multiplier (the network is most fragile at the start)
     "early_mult": 1.25,
     "useful_mult": 1.5,       # a block that carried paid work counts more than a block of native work
+    "grace_minutes": 0,       # blocks in the first minutes after the start do not count (0: all count). A lever for the team if the launch is found to be gamed (blocks mined in advance)
+    "useful_cap_per_job": 20,  # at most this many blocks of one job (class "job") get the paid-work multiplier; the others count 1.0
     "min_active_days": 3,     # distinct 24-hour windows with at least one block
     "min_share": 0.00005,     # of all the points (0.005 %): no dust
     "pool_pct": 0.7,          # informational: percentage of the maximum mainnet supply set aside for THIS testnet, the first of five (docs/19 section 1: 0.7 / 1.05 / 1.4 / 1.75 / 2.1 %)
@@ -68,9 +71,31 @@ def fetch_blocks(node, timeout=30):
         if not page:
             break
         for b in page:
-            out.append({"height": b["height"], "timestamp": b["timestamp"], "miner": b["miner"], "work": b["work"]["type"]})
+            w = b["work"]
+            blk = {"height": b["height"], "timestamp": b["timestamp"], "miner": b["miner"], "work": w["type"]}
+            if b.get("target") is not None:
+                blk["target"] = int(b["target"])
+            if w.get("job"):
+                blk["job"] = w["job"]
+                unit = w.get("op", w.get("layer", w.get("block")))
+                if unit is not None:
+                    blk["unit"] = json.dumps(unit)
+            out.append(blk)
         start = min(b["height"] for b in page) - 1
     out.sort(key=lambda b: b["height"])
+    # who submitted each job that a block carried: a miner that is its own client is not paid the multiplier (see score)
+    clients = {}
+    for b in out:
+        j = b.get("job")
+        if not j:
+            continue
+        if j not in clients:
+            try:
+                clients[j] = get(f"/api/job/{j}").get("client")
+            except Exception:
+                clients[j] = None  # unknown: the per-job limits still apply
+        if clients[j]:
+            b["client"] = clients[j]
     return out
 
 
@@ -92,13 +117,27 @@ def score(blocks, start_ts, p, registered=None, excluded=(), pools=None, unaudit
     pools = pools or {}
     pots = {a: {} for a in pools}
     pool_blocks = {a: 0 for a in pools}
+    job_blocks, seen_units = {}, set()
     for b in blocks:
         ts = b["timestamp"]
-        if ts < start_ts:
+        if ts < start_ts + p["grace_minutes"] * 60:
             continue
         last_ts = max(last_ts, ts)
         ep = (ts - start_ts) // epoch_secs
         useful = b["work"] != "native"
+        if useful:
+            # paid work that nobody else asked for is not paid work: a miner that is its own client, an endless job mined again and again, the same
+            # operation / layer / product mined twice. Such a block is a valid block, it counts 1.0
+            job = b.get("job")
+            if b.get("client") and b["client"] == b["miner"]:
+                useful = False
+            elif job and b["work"] == "job":
+                job_blocks[job] = job_blocks.get(job, 0) + 1
+                useful = job_blocks[job] <= p["useful_cap_per_job"]
+            elif job:
+                key = (job, b.get("unit"))
+                useful = key not in seen_units
+                seen_units.add(key)
         pts = (p["useful_mult"] if useful else 1.0) * (p["early_mult"] if ts - start_ts < p["early_days"] * 86400 else 1.0)
         if b["miner"] in pools:
             pots[b["miner"]][ep] = pots[b["miner"]].get(ep, 0.0) + pts
@@ -152,7 +191,8 @@ def score(blocks, start_ts, p, registered=None, excluded=(), pools=None, unaudit
         r["rank"] = i
         r["pool_share"] = (r["points"] / elig_total) if r["eligible"] and elig_total else 0.0
     return {
-        "totals": {"blocks": sum(r["blocks"] for r in rows), "miners": len(rows), "eligible": sum(1 for r in rows if r["eligible"]),
+        "totals": {"blocks": sum(r["blocks"] for r in rows), "pool_blocks": sum(pool_blocks.values()),
+                   "chain_blocks": sum(r["blocks"] for r in rows) + sum(pool_blocks.values()), "miners": len(rows), "eligible": sum(1 for r in rows if r["eligible"]),
                    "points": round(total, 4), "eligible_points": round(elig_total, 4), "last_block_time": last_ts},
         "epochs": [{"index": k, "blocks": v} for k, v in sorted(epochs.items())],
         "pools": pool_report,

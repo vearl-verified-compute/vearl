@@ -1285,7 +1285,7 @@ impl Pool {
         let ti = p.get("ti").and_then(|x| x.as_u64()).ok_or_else(|| err(E_BAD_REQUEST, "ti required"))?;
         let tj = p.get("tj").and_then(|x| x.as_u64()).ok_or_else(|| err(E_BAD_REQUEST, "tj required"))?;
         // phase 1 (lock): authorisation, rate, job, nonce range, duplicate
-        let (job, grace, login, targets, ip) = {
+        let (job, grace, login, targets, _ip) = {
             let mut g = self.inner.lock().unwrap();
             let now = Instant::now();
             let (slot, target, prev, ip, login, limited) = {
@@ -1364,9 +1364,10 @@ impl Pool {
             if let Some(s) = g.sess.get_mut(&cid) {
                 s.rejected += 1;
             }
-            if Self::strike(&mut g, cid, 5) {
-                self.ban(&mut g, ip);
-            }
+            // No strike/ban here: a share below the share target costs the pool nothing (unlike a
+            // duplicate or an out-of-range nonce) and routinely happens when a client is briefly slow
+            // to apply a `set_target` update (vardiff) or just connected with a stale target of its
+            // own; banning on it punishes honest, out-of-sync clients far more than attackers.
             return Err(err(E_LOW_DIFF, "share above the share target (jackpot not low enough)"));
         };
         // never harder than the network target of the job (a block must also be a share): after a difficulty drop the session target of the previous
