@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use std::io::{BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -125,7 +125,42 @@ fn submit_line(live: &Live, job: &JobSpec, en: u64, ti: usize, tj: usize) -> Str
     json!({"id": id, "method": "submit", "params": {"job_id": job.id, "extra_nonce": u64hex(en), "ti": ti, "tj": tj}}).to_string()
 }
 
-fn cpu_worker(live: Arc<Live>, tid: usize, nthreads: usize, stats: Arc<MinerStats>, stop: Arc<AtomicBool>, tx: Sender<String>) {
+// Bound startup bursts without blocking compute workers or delaying control messages.
+const SHARE_QUEUE_CAPACITY: usize = 80;
+struct PendingShare {
+    line: String,
+    generation: u64,
+    jackpot: Hash,
+    block_target: u64,
+}
+
+enum OutboundMessage {
+    Control(String),
+    Share(PendingShare),
+}
+
+fn next_message(control: &Receiver<String>, shares: &Receiver<PendingShare>) -> Option<OutboundMessage> {
+    if let Ok(line) = control.try_recv() {
+        Some(OutboundMessage::Control(line))
+    } else {
+        shares.recv_timeout(Duration::from_millis(100)).ok().map(OutboundMessage::Share)
+    }
+}
+
+impl PendingShare {
+    fn eligible(&self, live: &Live) -> bool {
+        self.generation == live.gen.load(Ordering::SeqCst)
+            && meets_target(&self.jackpot, live.share_target.load(Ordering::SeqCst).max(self.block_target))
+    }
+}
+
+fn queue_share(tx: &SyncSender<PendingShare>, live: &Live, job: &JobSpec, generation: u64, jackpot: Hash, en: u64, ti: usize, tj: usize) {
+    let share = PendingShare { line: submit_line(live, job, en, ti, tj), generation, jackpot, block_target: job.target };
+    // A full/disconnected queue must not block the GPU or grow memory indefinitely.
+    let _ = tx.try_send(share);
+}
+
+fn cpu_worker(live: Arc<Live>, tid: usize, nthreads: usize, stats: Arc<MinerStats>, stop: Arc<AtomicBool>, tx: SyncSender<PendingShare>) {
     let mut cache: Option<(u64, WorkParams, Vec<i8>, Vec<i8>)> = None;
     while live.alive.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
         let Some((gen, job)) = live.current() else {
@@ -149,7 +184,7 @@ fn cpu_worker(live: Arc<Live>, tid: usize, nthreads: usize, stats: Arc<MinerStat
             let st = live.share_target.load(Ordering::SeqCst);
             for (idx, jp) in out.jackpots.iter().enumerate() {
                 if meets_target(jp, st) {
-                    let _ = tx.send(submit_line(&live, &job, counter, idx / tiles, idx % tiles));
+                    queue_share(&tx, &live, &job, gen, *jp, counter, idx / tiles, idx % tiles);
                 }
             }
             stats.sigmas.fetch_add(1, Ordering::Relaxed);
@@ -159,7 +194,7 @@ fn cpu_worker(live: Arc<Live>, tid: usize, nthreads: usize, stats: Arc<MinerStat
 }
 
 #[cfg(feature = "gpu")]
-fn gpu_worker(live: Arc<Live>, stats: Arc<MinerStats>, stop: Arc<AtomicBool>, tx: Sender<String>, dev: usize, idx: u64, count: u64) {
+fn gpu_worker(live: Arc<Live>, stats: Arc<MinerStats>, stop: Arc<AtomicBool>, tx: SyncSender<PendingShare>, dev: usize, idx: u64, count: u64) {
     let mut cache: Option<(u64, WorkParams, crate::gpu::GpuJob)> = None;
     while live.alive.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
         let Some((gen, job)) = live.current() else {
@@ -202,7 +237,7 @@ fn gpu_worker(live: Arc<Live>, stats: Arc<MinerStats>, stop: Arc<AtomicBool>, tx
             let st = live.share_target.load(Ordering::SeqCst);
             for (d, idx, jp) in hits {
                 if meets_target(&jp, st) {
-                    let _ = tx.send(submit_line(&live, &job, counter + d as u64, idx / tiles, idx % tiles));
+                    queue_share(&tx, &live, &job, gen, jp, counter + d as u64, idx / tiles, idx % tiles);
                 }
             }
             stats.sigmas.fetch_add(bs, Ordering::Relaxed);
@@ -226,7 +261,8 @@ fn session(cfg: &MinerConfig, stats: &Arc<MinerStats>, stop: &Arc<AtomicBool>) -
     }
     writeln!(writer, "{}", json!({"id": 1, "method": "login", "params": login})).map_err(|e| e.to_string())?;
     // write thread: shares + periodic ping
-    let (tx, rx) = channel::<String>();
+    let (tx, control_rx) = channel::<String>();
+    let (share_tx, rx) = sync_channel::<PendingShare>(SHARE_QUEUE_CAPACITY);
     {
         let (live, stop) = (live.clone(), stop.clone());
         thread::spawn(move || {
@@ -234,30 +270,31 @@ fn session(cfg: &MinerConfig, stats: &Arc<MinerStats>, stop: &Arc<AtomicBool>) -
             // the shares are emitted at most ~40/s (burst 80): beyond that the pool would refuse anyway (starting target too easy before the `hint`)
             let (mut tokens, mut t_tok) = (80.0f64, Instant::now());
             while live.alive.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
-                match rx.recv_timeout(Duration::from_millis(250)) {
-                    Ok(l) => {
+                // Hints/stats cannot sit behind a burst of shares mined at an easy target.
+                let line = match next_message(&control_rx, &rx) {
+                    Some(OutboundMessage::Control(control)) => Some(control),
+                    Some(OutboundMessage::Share(share)) => {
                         tokens = (tokens + t_tok.elapsed().as_secs_f64() * 40.0).min(80.0);
                         t_tok = Instant::now();
-                        if l.contains("\"submit\"") {
-                            if tokens < 1.0 {
-                                continue;
-                            }
-                            tokens -= 1.0;
+                        if !share.eligible(&live) || tokens < 1.0 {
+                            continue;
                         }
-                        if writeln!(writer, "{l}").is_err() {
-                            live.alive.store(false, Ordering::SeqCst);
-                        }
-                        last = Instant::now();
+                        tokens -= 1.0;
+                        Some(share.line)
                     }
-                    Err(_) => {
-                        if last.elapsed() > Duration::from_secs(30) {
-                            let id = live.next_id.fetch_add(1, Ordering::SeqCst);
-                            if writeln!(writer, "{}", json!({"id": id, "method": "ping"})).is_err() {
-                                live.alive.store(false, Ordering::SeqCst);
-                            }
-                            last = Instant::now();
-                        }
+                    None => None,
+                };
+                if let Some(line) = line {
+                    if writeln!(writer, "{line}").is_err() {
+                        live.alive.store(false, Ordering::SeqCst);
                     }
+                    last = Instant::now();
+                } else if last.elapsed() > Duration::from_secs(30) {
+                    let id = live.next_id.fetch_add(1, Ordering::SeqCst);
+                    if writeln!(writer, "{}", json!({"id": id, "method": "ping"})).is_err() {
+                        live.alive.store(false, Ordering::SeqCst);
+                    }
+                    last = Instant::now();
                 }
             }
             let _ = writer.shutdown(std::net::Shutdown::Both);
@@ -273,7 +310,7 @@ fn session(cfg: &MinerConfig, stats: &Arc<MinerStats>, stop: &Arc<AtomicBool>) -
     #[cfg(not(feature = "gpu"))]
     let threads = if cfg.gpu { gpu_devs.len().max(1) } else { cfg.threads.max(1) };
     for t in 0..threads {
-        let (l, s, st, txc) = (live.clone(), stats.clone(), stop.clone(), tx.clone());
+        let (l, s, st, txc) = (live.clone(), stats.clone(), stop.clone(), share_tx.clone());
         if cfg.gpu {
             #[cfg(feature = "gpu")]
             {
@@ -446,4 +483,59 @@ pub fn run(cfg: MinerConfig, stats: Arc<MinerStats>, stop: Arc<AtomicBool>) {
 /// Helper for tests and tools: public key of the pool from a job.
 pub fn pool_key_of(j: &JobSpec) -> String {
     hex(&j.miner)
+}
+
+#[cfg(test)]
+mod outbound_tests {
+    use super::*;
+
+    fn live(target: u64) -> Live {
+        Live { job: Mutex::new(None), gen: AtomicU64::new(1), share_target: AtomicU64::new(target), alive: AtomicBool::new(true), next_id: AtomicU64::new(2) }
+    }
+
+    fn share(jackpot: u64) -> PendingShare {
+        let mut hash = [0; 32];
+        hash[..8].copy_from_slice(&jackpot.to_be_bytes());
+        PendingShare { line: "share".into(), generation: 1, jackpot: hash, block_target: 5 }
+    }
+
+    #[test]
+    fn queued_shares_are_rechecked_after_target_tightens() {
+        let live = live(100);
+        let (tx, rx) = sync_channel(3);
+        for jackpot in [10, 40, 80] { tx.try_send(share(jackpot)).unwrap_or_else(|_| panic!("queue unexpectedly full")); }
+        // All were valid when produced, but only one still qualifies at send time.
+        live.share_target.store(20, Ordering::SeqCst);
+        let sent: Vec<_> = rx.try_iter().filter(|s| s.eligible(&live)).collect();
+        assert_eq!(sent.len(), 1);
+        assert!(meets_target(&sent[0].jackpot, 20));
+    }
+
+    #[test]
+    fn queued_shares_from_replaced_job_are_dropped() {
+        let live = live(100);
+        let queued = share(1);
+        assert!(queued.eligible(&live));
+        live.gen.store(2, Ordering::SeqCst);
+        assert!(!queued.eligible(&live));
+    }
+
+    #[test]
+    fn network_block_survives_harder_session_target() {
+        let live = live(1);
+        assert!(share(3).eligible(&live));
+        assert!(!share(6).eligible(&live));
+    }
+
+    #[test]
+    fn easy_target_burst_is_bounded_and_does_not_block_control() {
+        let (tx, rx) = sync_channel(SHARE_QUEUE_CAPACITY);
+        for _ in 0..SHARE_QUEUE_CAPACITY { assert!(tx.try_send(share(1)).is_ok()); }
+        assert!(matches!(tx.try_send(share(1)), Err(std::sync::mpsc::TrySendError::Full(_))));
+        let (control, control_rx) = channel();
+        control.send("rate hint".to_string()).unwrap();
+        // The writer checks this independent queue before consuming another share.
+        assert!(matches!(next_message(&control_rx, &rx), Some(OutboundMessage::Control(line)) if line == "rate hint"));
+        assert_eq!(rx.try_iter().count(), SHARE_QUEUE_CAPACITY);
+    }
 }
