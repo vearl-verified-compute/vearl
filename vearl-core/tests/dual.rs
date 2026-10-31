@@ -5,6 +5,10 @@ use vearl_core::chain::*;
 use vearl_core::dual::*;
 use vearl_core::net::*;
 
+// These tests share external-miner.log in the process working directory.
+// Hold the lock through scheduler shutdown and log cleanup.
+static EXTERNAL_LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn node() -> NodeHandle {
     let mut g = devnet_genesis();
     g.retarget = Retarget::Fixed;
@@ -33,6 +37,7 @@ fn sleeper() -> Vec<String> {
 
 #[test]
 fn a_paid_job_takes_the_gpu_back_from_the_external_miner_within_a_second() {
+    let _log_guard = EXTERNAL_LOG_LOCK.lock().unwrap();
     let nd = node();
     let sh = nd.shared.clone();
     // 10 s cycle: 8 s for the external miner, 2 s for Vearl
@@ -57,6 +62,7 @@ fn a_paid_job_takes_the_gpu_back_from_the_external_miner_within_a_second() {
 
 #[test]
 fn without_a_share_for_the_external_miner_vearl_always_owns_the_gpu() {
+    let _log_guard = EXTERNAL_LOG_LOCK.lock().unwrap();
     let nd = node();
     let sh = nd.shared.clone();
     spawn_scheduler(sh.clone(), DualCfg { cmd: sleeper(), fee: None, share_pct: 0, cycle_s: 10, quantus_bin: None, beacon: None });
@@ -72,6 +78,7 @@ fn without_a_share_for_the_external_miner_vearl_always_owns_the_gpu() {
 /// it never opens it.
 #[test]
 fn a_quantus_miner_that_is_not_the_pinned_one_is_never_started() {
+    let _log_guard = EXTERNAL_LOG_LOCK.lock().unwrap();
     let dir = std::env::temp_dir().join(format!("vearl-pinned-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let fake = dir.join("quantus-miner");
