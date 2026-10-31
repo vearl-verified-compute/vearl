@@ -26,6 +26,8 @@ jobs:
       # the tools that the end-to-end pool test runs check Ed25519 signatures with this package
       - name: python dependencies
         run: pip install cryptography
+      - name: monitor regression tests
+        run: python -m unittest discover -s ../deploy/monitor -p "test_*.py"
       # CPU build: the GPU kernels need a CUDA toolkit and a card, they are tested by hand (docs/15 section 3)
       - name: build
         run: cargo build --release --bins
