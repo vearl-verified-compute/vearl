@@ -1039,6 +1039,29 @@ def build_extension(V, path):
 
 
 
+def snapshot_indices(vectors):
+    """States needed by the negative cases; retain no other tensor history."""
+    def block_has(b, name, jid=None, fraud=None):
+        for t in b["txs"]:
+            p = t["kind"].get("Prog", {})
+            if name not in p:
+                continue
+            if jid is not None and hb(p[name]["job_id"]).hex() != jid:
+                continue
+            if fraud is not None and fraud not in p[name]["kind"]:
+                continue
+            return True
+        return False
+    jobs = vectors["final"]["jobs"]
+    blocks = vectors["blocks"]
+    needed = {next(k for k, b in enumerate(blocks) if block_has(b, "Submit")) - 1}
+    needed.add(max(k for k, b in enumerate(blocks) if block_has(b, "PostOp", jobs[0]["id"])))
+    needed.add(max(k for k, b in enumerate(blocks) if block_has(b, "Claim", jobs[2]["id"])))
+    for fraud in ("Gemm", "Act", "Elem", "Col"):
+        needed.add(next(k for k, b in enumerate(blocks) if block_has(b, "Fraud", fraud=fraud)) - 1)
+    return needed
+
+
 def main(path):
     V = json.load(open(path))
     bad = 0
@@ -1050,8 +1073,9 @@ def main(path):
         print(("ok   " if ok else "FAIL"), name, "" if ok else f"\n   got {got}\n   expected {want}")
 
     m = ProgChain(V)
-    snaps, kinds = [], {}
-    for b in V["blocks"]:
+    needed = snapshot_indices(V)
+    snaps, kinds = {}, {}
+    for block_index, b in enumerate(V["blocks"]):
         for t in b["txs"]:
             if tx_bytes(t).hex() != t["tx_bincode"] or tx_id(t).hex() != t["id"]:
                 bad += 1
@@ -1061,7 +1085,8 @@ def main(path):
             kinds[name] = kinds.get(name, 0) + 1
         m.apply(b)
         assert S.H("vearl/header/v1", header_bytes(b["header"])).hex() == b["hash"], "header hash"
-        snaps.append(copy.deepcopy(m))
+        if block_index in needed:
+            snaps[block_index] = copy.deepcopy(m)
     chk("%d valid blocks; transactions: %s" % (len(V["blocks"]), dict(sorted(kinds.items()))), len(m.headers), V["final"]["height"])
     F = V["final"]
     chk("emission", m.minted, F["minted"])
