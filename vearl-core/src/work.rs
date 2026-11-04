@@ -396,6 +396,18 @@ pub struct TileProof {
     pub b_paths: Vec<Vec<Hash>>,
 }
 
+impl TileProof {
+    /// What a node keeps in memory of the proof of a buried block: only the tile. A real proof always has `tile` rows, so this is never mistaken for one,
+    /// and `verify_tile_proof` refuses it.
+    pub fn evicted(ti: u32, tj: u32) -> Self {
+        TileProof { ti, tj, a_rows: vec![], a_paths: vec![], b_cols: vec![], b_paths: vec![] }
+    }
+
+    pub fn is_evicted(&self) -> bool {
+        self.a_rows.is_empty()
+    }
+}
+
 pub fn build_proof(cm: &CommittedMatrices, ti: usize, tj: usize, p: &WorkParams) -> TileProof {
     let (n, t) = (p.n, p.tile);
     let (mut a_rows, mut a_paths, mut b_cols, mut b_paths) = (vec![], vec![], vec![], vec![]);

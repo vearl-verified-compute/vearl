@@ -2069,21 +2069,22 @@ fn load_chain(chain: &mut Chain, path: &PathBuf) -> usize {
 fn persist(n: &mut Node) {
     let Some(st) = n.store.as_mut() else { return };
     let blocks = &n.chain.blocks;
+    let mut cache = HashMap::new();
     let prefix_ok = st.persisted == 0 || blocks.get(st.persisted - 1).map(|b| b.header.hash()) == Some(st.persisted_tip);
     let res = if prefix_ok {
         OpenOptions::new().create(true).append(true).open(&st.path).and_then(|mut f| {
             for b in &blocks[st.persisted.min(blocks.len())..] {
-                write_frame(&mut f, b)?;
+                write_frame(&mut f, &n.chain.full_block(b, &mut cache))?;
             }
             f.sync_data()
         })
     } else {
-        // reorganisation: the complete chain is rewritten (temporary file + atomic rename)
+        // reorganisation: the complete chain is rewritten (temporary file + atomic rename); the proofs dropped from memory are rebuilt
         let tmp = st.path.with_extension("tmp");
         File::create(&tmp)
             .and_then(|mut f| {
                 for b in blocks {
-                    write_frame(&mut f, b)?;
+                    write_frame(&mut f, &n.chain.full_block(b, &mut cache))?;
                 }
                 f.sync_data()
             })
@@ -2236,8 +2237,9 @@ fn on_msg(sh: &Arc<Shared>, n: &mut Node, id: u64, m: Msg) -> Result<(), String>
 /// requester keeps going as long as the batch is not EMPTY (it no longer assumes that an incomplete batch is the end of the chain).
 fn sync_batch<T: Serialize>(n: &Node, from: usize, f: impl Fn(&Block) -> T) -> Vec<T> {
     let (mut out, mut bytes) = (Vec::new(), 0u64);
+    let mut cache = HashMap::new(); // epoch matrices rebuilt for the old blocks of this batch (their proof is not kept in memory)
     for b in n.chain.blocks.iter().skip(from).take(BATCH) {
-        let item = f(b);
+        let item = f(&n.chain.full_block(b, &mut cache));
         let sz = bincode::serialized_size(&item).unwrap_or(u64::MAX);
         if !out.is_empty() && bytes.saturating_add(sz) > n.sync_budget {
             break;

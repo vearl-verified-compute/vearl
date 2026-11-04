@@ -517,11 +517,21 @@ pub fn audit_pool(cfg: &AuditCfg, inp: &AuditInput) -> AuditReport {
         let top = chain.iter().map(|b| b.height).max().unwrap_or(0);
         let (mut jobs_total, mut jobs_off) = (0usize, 0usize);
         for (e, d) in &good {
+            let mut noted_above = false;
             for j in parse_jobs(d).unwrap() {
                 jobs_total += 1;
-                if j.height > top + 2 {
+                if j.height > top + MAX_CHAIN_LAG {
                     add(Some(*e), Severity::Fraud, "job_from_the_future", format!("epoch {e}: a job is at height {} but the chain is at {top}", j.height));
                     break;
+                }
+                if j.height > top + 2 {
+                    // the copy of the chain we audit with can be minutes (even an hour) old: the pool published a document for an hour that ended after it. The next
+                    // audit, with a newer copy, checks these jobs against the real blocks (a job built on a block that is not on the chain counts in `jobs_off`)
+                    if !noted_above {
+                        noted_above = true;
+                        add(Some(*e), Severity::Info, "job_above_the_chain_we_hold", format!("epoch {e}: a job is at height {} but the chain we hold stops at {top}", j.height));
+                    }
+                    continue;
                 }
                 if j.height > 0 && hash_at.get(&(j.height - 1)).map_or(false, |h| **h != hex(&j.prev)) {
                     jobs_off += 1;

@@ -572,6 +572,11 @@ fn hostile_documents_are_refused_or_held_and_never_trusted() {
     let mut inp = doc(3600, &[job(900_000, t0 + 10)], &[rec(0, 1)]);
     inp.chain = Some(vec![ChainBlock { height: 10, timestamp: t0, miner: "x".into(), hash: Some("00".repeat(32)) }]);
     assert!(audit_pool(&cfg, &inp).has("job_from_the_future"));
+    // a copy of the chain a few minutes (or an hour) behind the hour that just ended: information, never a fraud (AriaPool, 2026-11-04)
+    let mut inp = doc(3600, &[job(60, t0 + 10)], &[rec(0, 1)]);
+    inp.chain = Some(vec![ChainBlock { height: 10, timestamp: t0, miner: "x".into(), hash: Some("00".repeat(32)) }]);
+    let rep = audit_pool(&cfg, &inp);
+    assert!(rep.has("job_above_the_chain_we_hold") && !rep.has("job_from_the_future"), "{:?}", codes(&rep));
 
     // a document that appears long after its epoch: held
     let mut late = doc(3600, &[job(5, t0 + 10)], &[rec(0, 1)]);

@@ -140,6 +140,42 @@ def relax_target_ramp(report_path, blocks_path, ratio=TARGET_RAMP):
     return relaxed
 
 
+DEFAULT_WAIVERS = "/etc/vearl/rewards-waivers.json"
+
+
+def apply_waivers(report_path, waivers_path, pool_address):
+    """Turns SUSPECT findings that the project decided to accept into information, and recomputes the verdict and the status of every hour.
+
+    waivers_path: {"waivers": [{"pool": "vrl1...", "code": "late_document", "epoch": 498013, "reason": "...", "date": "2026-10-26"}, ...]}
+    A waiver names the pool, the code of the finding and the hour (epoch): nothing broader. A `fraud` finding can never be waived, and a file that cannot
+    be read or understood waives nothing (the audit stays as it was written). The finding keeps its text, with the reason and the date added, and its
+    code becomes `waived_<code>`, so that the public report shows what was accepted and why. Returns the list of (code, epoch) that were waived."""
+    try:
+        with open(waivers_path, encoding="utf-8") as f:
+            wl = json.load(f)["waivers"]
+        with open(report_path, encoding="utf-8") as f:
+            rep_ = json.load(f)
+        mine = {(w["code"], int(w["epoch"])): w for w in wl if isinstance(w, dict) and w.get("pool") == pool_address and w.get("reason")}
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+    done = []
+    for fnd in rep_.get("findings", []):
+        if fnd.get("severity") != "suspect" or fnd.get("epoch") is None:
+            continue
+        w = mine.get((fnd.get("code"), int(fnd["epoch"])))
+        if not w:
+            continue
+        fnd["detail"] = f"{fnd.get('detail', '')} [waived by the project{(' on ' + w['date']) if w.get('date') else ''}: {w['reason']}]"
+        fnd["code"] = "waived_" + fnd["code"]
+        fnd["severity"] = "ok"
+        done.append((fnd["code"][len("waived_"):], int(fnd["epoch"])))
+    if done:
+        _recompute(rep_)
+        with open(report_path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(rep_, f, indent=1)
+    return done
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--spec", required=True)
@@ -152,6 +188,7 @@ def main():
     ap.add_argument("--max-epochs", default="400", help="most epochs read from a pool in one run")
     ap.add_argument("--audit-arg", action="append", default=[], help="extra argument for vearl-pool-audit (repeat), e.g. --audit-arg=--verify-max --audit-arg=500")
     ap.add_argument("--receipts-dir", help="folder of pool-receipts*.jsonl files kept by miners (more evidence for the audit)")
+    ap.add_argument("--waivers", default=DEFAULT_WAIVERS, help="optional file of findings that the project accepts (hour by hour, never a fraud), see apply_waivers")
     a = ap.parse_args()
     base = os.path.dirname(os.path.abspath(a.spec))
     here = os.path.dirname(os.path.abspath(__file__))
@@ -179,6 +216,9 @@ def main():
             days = relax_target_ramp(report, a.blocks)
             if days:
                 print(f"{p.get('name', p['address'])}: work-versus-blocks test not applicable on day(s) {days} (the chain's target moved by more than x{TARGET_RAMP:.0f}); verdict recomputed")
+            waived = apply_waivers(report, a.waivers, p["address"])
+            if waived:
+                print(f"{p.get('name', p['address'])}: {len(waived)} finding(s) accepted by the project (waivers): {waived}; verdict recomputed")
             days = relax_stale_loss(report)
             if days:
                 print(f"{p.get('name', p['address'])}: work-versus-blocks test on day(s) {days}: the claimed work is plausible once {100 * STALE_ALLOWANCE:.0f} % of it is allowed to be lost to stale jobs; verdict recomputed")

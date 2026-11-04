@@ -74,6 +74,10 @@ name = "attackreport"
 path = "src/bin/attackreport.rs"
 
 [[bin]]
+name = "proofcheck"
+path = "src/bin/proofcheck.rs"
+
+[[bin]]
 name = "vearl-wallet"
 path = "src/bin/wallet.rs"
 

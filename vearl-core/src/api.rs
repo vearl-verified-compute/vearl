@@ -154,6 +154,8 @@ fn status(sh: &Arc<Shared>) -> Response {
             "accounts": c.state.accounts.values().filter(|a| a.balance != 0 || a.nonce != 0).count(),
             "genesis_hash": hex(&sh.genesis_hash), "version": env!("CARGO_PKG_VERSION"), "reward": amount(base_reward(c.height())),
             "node_time": crate::net::now_secs(),
+            // seconds since the last block: a node that is syncing, restarting or stuck shows a large value (a watchdog and the rewards job read it)
+            "tip_age": crate::net::now_secs().saturating_sub(c.tip_ts()),
         }),
     )
 }

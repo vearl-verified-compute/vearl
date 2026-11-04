@@ -37,7 +37,19 @@ pub fn txs_bytes(txs: &[SignedTx]) -> u64 {
 /// They are used to reorganise without replaying the whole chain from genesis.
 /// 480 s of blocks (16 blocks of 30 s before the block time became 10 s): 64 snapshots reach back 8.5 hours, the horizon of MESS.
 pub const SNAP_EVERY: u64 = 480 / BLOCK_TIME;
+/// The horizon of the snapshots, in snapshot intervals: SNAP_KEEP * SNAP_EVERY blocks.
 pub const SNAP_KEEP: usize = 64;
+/// The newest snapshots are kept at every interval, the older ones one in SNAP_THIN (see `validate_inner`).
+pub const SNAP_NEAR: usize = 8;
+pub const SNAP_THIN: u64 = 8;
+
+/// The tile proof of a block of the native work class is about 42 KB, 95 % of the block, and nothing reads it again once the block is buried: only a
+/// peer that syncs asks for old blocks. A node keeps the proofs of the last PROOF_KEEP blocks (more than the snapshots reach back, so a reorganisation
+/// never needs a dropped one) and rebuilds the others from the epoch matrices when it has to serve them (`Chain::full_block`), byte for byte what the
+/// miner built. At 100,000 blocks this is 4 GB less in memory; the file on disk and the network messages do not change.
+pub const PROOF_KEEP: usize = 4096;
+/// Epochs whose matrices (about 2 MB each) a node keeps in memory: the current one and a few around it.
+pub const NATIVE_KEEP: usize = 24;
 
 /// Slowing down of deep reorganisations (MESS, inspired by ECIP-1100 of Ethereum Classic): a competing chain must have
 /// accumulated `f(t)` times the work of ours since the common ancestor, where `t` = time elapsed on OUR chain since that ancestor,
@@ -272,6 +284,8 @@ pub struct Chain {
     snaps: std::collections::BTreeMap<u64, (State, u64)>,
     native: HashMap<u64, Arc<CommittedMatrices>>,
     gpu_cache: GpuCache,
+    /// how many recent blocks keep their tile proof in memory (PROOF_KEEP; tests lower it)
+    proof_keep: usize,
 }
 
 pub fn next_target(target: u64, dt: u64) -> u64 {
@@ -318,7 +332,12 @@ impl Chain {
         }
         let mut snaps = std::collections::BTreeMap::new();
         snaps.insert(0, (state.clone(), initial_target));
-        Self { params, blocks: vec![], state, target: initial_target, genesis_supply: supply, retarget: Retarget::default(), genesis_ts, snaps, native: HashMap::new(), gpu_cache: Default::default() }
+        Self { params, blocks: vec![], state, target: initial_target, genesis_supply: supply, retarget: Retarget::default(), genesis_ts, snaps, native: HashMap::new(), gpu_cache: Default::default(), proof_keep: PROOF_KEEP }
+    }
+
+    /// Tests: keep the proofs of fewer blocks (must stay above what a reorganisation can touch in the scenario).
+    pub fn set_proof_keep(&mut self, keep: usize) {
+        self.proof_keep = keep;
     }
 
     pub fn from_config(c: &GenesisConfig) -> Self {
@@ -344,15 +363,62 @@ impl Chain {
 
     pub fn native_committed(&mut self, epoch: u64) -> &CommittedMatrices {
         let p = self.params;
+        if !self.native.contains_key(&epoch) && self.native.len() >= NATIVE_KEEP {
+            // forget the epoch farthest from this one (every epoch ever validated used to stay: 2 MB each, forever)
+            if let Some(far) = self.native.keys().copied().max_by_key(|e| e.abs_diff(epoch)) {
+                self.native.remove(&far);
+            }
+        }
         self.native.entry(epoch).or_insert_with(|| {
             let (a, b) = native_matrices(epoch, &p);
             Arc::new(CommittedMatrices::new(a, b, &p))
         })
     }
 
+    /// Number of epochs whose matrices are held in memory (bounded by NATIVE_KEEP).
+    pub fn native_cached(&self) -> usize {
+        self.native.len()
+    }
+
+    /// Number of state snapshots held (see SNAP_NEAR / SNAP_THIN).
+    pub fn snapshot_count(&self) -> usize {
+        self.snaps.len()
+    }
+
     fn native_arc(&mut self, epoch: u64) -> Arc<CommittedMatrices> {
         self.native_committed(epoch);
         self.native[&epoch].clone()
+    }
+
+    /// The block with its tile proof, also when the proof was dropped from memory (see PROOF_KEEP): rebuilt from the epoch matrices, which is exactly what the
+    /// miner did. `cache` holds the matrices built on the way, so a batch of blocks of one epoch builds them once.
+    pub fn full_block<'a>(&self, b: &'a Block, cache: &mut HashMap<u64, Arc<CommittedMatrices>>) -> std::borrow::Cow<'a, Block> {
+        if !b.proof.is_evicted() {
+            return std::borrow::Cow::Borrowed(b);
+        }
+        let (p, epoch) = (self.params, b.header.height / EPOCH_LEN);
+        let cm = match self.native.get(&epoch) {
+            Some(c) => c.clone(),
+            None => cache
+                .entry(epoch)
+                .or_insert_with(|| {
+                    let (a, bm) = native_matrices(epoch, &p);
+                    Arc::new(CommittedMatrices::new(a, bm, &p))
+                })
+                .clone(),
+        };
+        std::borrow::Cow::Owned(Block { header: b.header.clone(), proof: build_proof(&cm, b.header.ti as usize, b.header.tj as usize, &p), txs: b.txs.clone() })
+    }
+
+    /// Drops the tile proof of the native block that just got PROOF_KEEP blocks deep (other work classes are rare and their data is not rebuildable).
+    fn evict_buried_proof(&mut self) {
+        let len = self.blocks.len();
+        if len > self.proof_keep {
+            let b = &mut self.blocks[len - 1 - self.proof_keep];
+            if matches!(b.header.class, WorkClass::Native) && !b.proof.is_evicted() {
+                b.proof = TileProof::evicted(b.proof.ti, b.proof.tj);
+            }
+        }
     }
 
     /// Verifies the supply: balances + escrows + bonds + burn == genesis + emission.
@@ -453,6 +519,9 @@ impl Chain {
             return Err("header work roots mismatch".into());
         }
         let sg = sigma(&hd.prev, &hd.miner, &hd.class, hd.extra_nonce, &hd.tx_root, hd.timestamp);
+        if block.proof.is_evicted() {
+            return Err("missing tile proof".into());
+        }
         if (hd.ti as usize, hd.tj as usize) != (block.proof.ti as usize, block.proof.tj as usize) {
             return Err("tile mismatch".into());
         }
@@ -476,6 +545,7 @@ impl Chain {
         self.state = st;
         let ema = next_target(self.target, dt);
         self.blocks.push(block);
+        self.evict_buried_proof();
         self.target = match self.retarget {
             Retarget::Fixed => self.target,
             Retarget::Ema => ema,
@@ -485,10 +555,12 @@ impl Chain {
         let h = self.height();
         if h % SNAP_EVERY == 0 {
             self.snaps.insert(h, (self.state.clone(), self.target));
-            while self.snaps.len() > SNAP_KEEP + 1 {
-                let k = *self.snaps.keys().nth(1).unwrap(); // never genesis (key 0)
-                self.snaps.remove(&k);
-            }
+            // Each snapshot is a complete copy of the state, which keeps growing with the jobs: 65 of them held several GB at 100,000 blocks. The newest
+            // SNAP_NEAR stay one every SNAP_EVERY blocks; the older ones are thinned to one every SNAP_EVERY * SNAP_THIN blocks, and nothing is kept
+            // further back than the horizon (SNAP_KEEP * SNAP_EVERY blocks) but the genesis. A rewind then replays at most SNAP_EVERY * SNAP_THIN blocks.
+            let near_from = h.saturating_sub(SNAP_NEAR as u64 * SNAP_EVERY);
+            let horizon = h.saturating_sub(SNAP_KEEP as u64 * SNAP_EVERY);
+            self.snaps.retain(|&k, _| k == 0 || (k > horizon && (k > near_from || k % (SNAP_EVERY * SNAP_THIN) == 0)));
         }
         Ok(())
     }
@@ -506,6 +578,11 @@ impl Chain {
         self.target = tg;
         self.snaps.retain(|k, _| *k <= snap_h);
         let removed = tail.split_off((h - snap_h) as usize);
+        // a rewind that starts from the genesis snapshot replays blocks whose proof was dropped from memory: rebuild them first (the removed blocks too, they
+        // may have to be replayed if the candidate chain is refused)
+        let mut cache = HashMap::new();
+        let tail: Vec<Block> = tail.into_iter().map(|b| if b.proof.is_evicted() { self.full_block(&b, &mut cache).into_owned() } else { b }).collect();
+        let removed: Vec<Block> = removed.into_iter().map(|b| if b.proof.is_evicted() { self.full_block(&b, &mut cache).into_owned() } else { b }).collect();
         for b in tail {
             self.validate_inner(b, None).map_err(|e| format!("rewind replay: {e}"))?;
         }

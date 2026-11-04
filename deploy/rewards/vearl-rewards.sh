@@ -5,10 +5,22 @@
 # or a hand-made /etc/vearl/rewards-registered.json from tools/verify_registration.py) and /etc/vearl/rewards-excluded.txt.
 set -euo pipefail
 START=${VEARL_TESTNET_START:-2026-10-23T16:00:00Z}
+NODE=127.0.0.1:8545
 OUT=/var/www/vearl-rewards
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
-ARGS=(--node 127.0.0.1:8545 --start "$START" --out "$TMP" --dump-blocks)
+# The node must be up to date. A node that is behind (restarting, syncing, stuck) makes honest pools look like liars to the audit (2026-10-29: three pools
+# marked "fraud" because the node had been stuck for a day), so nothing is published from it: the leaderboard stays as it was until the node has caught up.
+AGE=$(curl -fsS -m 10 "http://$NODE/api/status" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(max(0, d["node_time"] - d["tip_timestamp"]))' 2>/dev/null || echo 999999)
+MAX_AGE=${VEARL_REWARDS_MAX_TIP_AGE:-600}
+if [ "$AGE" -gt "$MAX_AGE" ]; then
+  echo "the last block of the node is $AGE s old (limit $MAX_AGE s): the leaderboard and the pool audit are left as they were" >&2
+  exit 0
+fi
+# ONE fresh copy of the chain for the pool audit and for the leaderboard. The audit used to read the copy of the PREVIOUS run, up to an hour old, so the hour
+# that had just ended looked as if the pool had built jobs above the chain.
+python3 /opt/vearl/tools/testnet_rewards.py --node "$NODE" --start "$START" --out "$TMP" --dump-blocks-only
+ARGS=(--blocks-file "$TMP/blocks.json" --start "$START" --out "$TMP")
 # the team can leave the first minutes of the testnet out of the score (docs/19): echo 30 > /etc/vearl/rewards-grace-minutes (absent: all blocks count)
 [ -s /etc/vearl/rewards-grace-minutes ] && ARGS+=(--grace-minutes "$(tr -dc 0-9 < /etc/vearl/rewards-grace-minutes)")
 # registered addresses: the list made by the registration processor (docs/19, vearl-register.timer), or a hand-made file
@@ -20,11 +32,11 @@ fi
 [ -s /etc/vearl/rewards-excluded.txt ] && ARGS+=(--exclude /etc/vearl/rewards-excluded.txt)
 # addresses that use the Quantus add-on without paying the development fee are not eligible (deploy/feeaudit, docs/17); the counts are public
 [ -s /var/lib/vearl/feeaudit/compliance.json ] && ARGS+=(--fee-compliance /var/lib/vearl/feeaudit/compliance.json)
-# registered mining pools (docs/19 section 3 bis): /etc/vearl/rewards-pools.json lists them; their signed ledgers are audited first, with the blocks
-# of the previous run, and the audit reports are read by the leaderboard
+# registered mining pools (docs/19 section 3 bis): /etc/vearl/rewards-pools.json lists them; their signed ledgers are audited first, with the fresh blocks,
+# and the audit reports are read by the leaderboard
 if [ -s /etc/vearl/rewards-pools.json ]; then
-  if [ -x /opt/vearl/bin/vearl-pool-audit ] && [ -s "$OUT/blocks.json" ]; then
-    python3 /opt/vearl/tools/audit_pools.py --spec /etc/vearl/rewards-pools.json --genesis /etc/vearl/genesis.json --blocks "$OUT/blocks.json" \
+  if [ -x /opt/vearl/bin/vearl-pool-audit ]; then
+    python3 /opt/vearl/tools/audit_pools.py --spec /etc/vearl/rewards-pools.json --genesis /etc/vearl/genesis.json --blocks "$TMP/blocks.json" \
       --audit-bin /opt/vearl/bin/vearl-pool-audit --last 72 || echo "pool audit failed (the previous reports stay in force)" >&2
   fi
   ARGS+=(--pools /etc/vearl/rewards-pools.json)

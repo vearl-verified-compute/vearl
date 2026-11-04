@@ -209,6 +209,7 @@ def main():
     ap.add_argument("--end", help="ignore the blocks after this ISO UTC time (final snapshot)")
     ap.add_argument("--out", required=True, help="output folder")
     ap.add_argument("--dump-blocks", action="store_true", help="save the blocks used in OUT/blocks.json (for reproduction)")
+    ap.add_argument("--dump-blocks-only", action="store_true", help="read the chain, write OUT/blocks.json and stop (the hourly job takes ONE fresh copy for the pool audit and the leaderboard)")
     ap.add_argument("--registered", help="JSON file made by verify_registration.py: only these addresses can be eligible")
     ap.add_argument("--exclude", help="text file, one address per line (disqualified, with a public reason in docs/19)")
     ap.add_argument("--fee-compliance", help="compliance.json of deploy/feeaudit/feeaudit.py: addresses that use the Quantus add-on without the development fee are not eligible")
@@ -227,6 +228,12 @@ def main():
     if a.end:
         end_ts = parse_time(a.end)
         blocks = [b for b in blocks if b["timestamp"] <= end_ts]
+    if a.dump_blocks_only:
+        os.makedirs(a.out, exist_ok=True)
+        with open(os.path.join(a.out, "blocks.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"data_hash": data_hash([b for b in blocks if b["timestamp"] >= start_ts]), "blocks": blocks}, f, separators=(",", ":"))
+        print(f"{len(blocks)} blocks written to {a.out}/blocks.json")
+        return 0
     registered = None
     if a.registered:
         registered = set(json.load(open(a.registered))["addresses"])

@@ -291,3 +291,80 @@ fn block_whose_transactions_exceed_the_byte_limit_is_rejected() {
     let one = SignedTx::new_pq(Tx { from: pq.pubkey(), nonce: 0, fee: 0, kind: TxKind::Transfer { to: pubkey(&a), amount: 1 } }, &pq);
     assert!(txs_bytes(&vec![one; MAX_BLOCK_TXS]) < MAX_BLOCK_TX_BYTES);
 }
+
+#[test]
+fn buried_proofs_leave_memory_and_come_back_byte_for_byte() {
+    let sk = key(1);
+    let mut chain = new_chain();
+    chain.set_proof_keep(3);
+    let originals: Vec<Block> = (0..10).map(|_| mine_one(&mut chain, &sk, vec![])).collect();
+    for (i, b) in chain.blocks.iter().enumerate() {
+        assert_eq!(b.proof.is_evicted(), i + 3 < 10, "block {i}: only the last 3 keep their proof");
+        assert_eq!((b.proof.ti, b.proof.tj), (originals[i].proof.ti, originals[i].proof.tj));
+    }
+    // rebuilt = what the miner built
+    let mut cache = std::collections::HashMap::new();
+    for (i, o) in originals.iter().enumerate() {
+        let full = chain.full_block(&chain.blocks[i], &mut cache);
+        assert_eq!(bincode::serialize(&*full).unwrap(), bincode::serialize(o).unwrap(), "block {i}");
+    }
+    // a node that syncs gets valid blocks
+    let mut other = new_chain();
+    for i in 0..10 {
+        other.validate_and_apply(chain.full_block(&chain.blocks[i], &mut cache).into_owned()).unwrap();
+    }
+    assert!(same_state(&chain, &other));
+    // a block without its proof is refused, it is never accepted from the network
+    let mut stripped = originals[0].clone();
+    stripped.proof = vearl_core::work::TileProof::evicted(stripped.proof.ti, stripped.proof.tj);
+    assert!(new_chain().validate_and_apply(stripped).unwrap_err().contains("missing tile proof"));
+    // a rewind that starts from the genesis snapshot replays blocks whose proof is gone, then the chain can be put back
+    let (tip, target) = (chain.tip_hash(), chain.target);
+    let removed = chain.rewind_to(2).unwrap();
+    assert_eq!((chain.height(), removed.len()), (2, 8));
+    assert!(removed.iter().all(|b| !b.proof.is_evicted()), "the removed blocks come back with their proof");
+    for b in removed {
+        chain.validate_and_apply(b).unwrap();
+    }
+    assert_eq!((chain.tip_hash(), chain.target), (tip, target));
+}
+
+#[test]
+fn native_matrices_of_old_epochs_do_not_pile_up() {
+    let mut chain = new_chain();
+    for e in 0..(NATIVE_KEEP as u64 + 10) {
+        chain.native_committed(e);
+    }
+    let _ = chain.native_committed(5); // asked again after being forgotten: rebuilt, same roots
+    let (a, b) = {
+        let c = chain.native_committed(5);
+        (c.a_root(), c.b_root())
+    };
+    let fresh = new_chain().native_committed(5).a_root();
+    assert_eq!(a, fresh);
+    assert!(chain.native_cached() <= NATIVE_KEEP, "{} epochs kept", chain.native_cached());
+    let _ = b;
+}
+
+#[test]
+fn old_state_snapshots_are_thinned_and_every_height_can_still_be_rewound_to() {
+    let sk = key(1);
+    let mut chain = new_chain();
+    let blocks = 1200u64; // newest snapshots at every interval (864..1200), older ones one in SNAP_THIN (384, 768), plus the genesis
+    for _ in 0..blocks {
+        mine_one(&mut chain, &sk, vec![]);
+    }
+    let all_of_them = blocks / SNAP_EVERY + 1;
+    assert!(chain.snapshot_count() < all_of_them as usize / 2, "{} snapshots kept of {all_of_them}", chain.snapshot_count());
+    assert!(chain.snapshot_count() >= SNAP_NEAR + 1, "the newest ones are all there");
+    // a rewind to a height far behind replays at most SNAP_EVERY * SNAP_THIN blocks, and putting the blocks back gives the same chain
+    let (tip, target) = (chain.tip_hash(), chain.target);
+    for h in [1100u64, 900, 500, 100] {
+        let removed = chain.rewind_to(h).unwrap();
+        assert_eq!((chain.height(), removed.len() as u64), (h, blocks - h));
+        for b in removed {
+            chain.validate_and_apply(b).unwrap();
+        }
+        assert_eq!((chain.tip_hash(), chain.target), (tip, target), "after rewinding to {h}");
+    }
+}

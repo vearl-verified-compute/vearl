@@ -513,7 +513,11 @@ class Gateway:
                 audit = {"checked": int(m.group(1)), "of": int(m.group(2))}
             if "WRONG" in out:
                 return self.finish(j, "rejected", "The miner's result failed the audit: a recomputed chunk did not match. A fraud proof was sent and the miner loses its bond.", audit=audit)
-            if "Accept: Ack { ok: true" not in out:
+            # the audit of a big job (or of a miner that answers slowly) can outlast the challenge window: the chain then settles the job by itself and the
+            # miner is paid, so our own Accept is refused. The audit found nothing wrong (every chunk drawn was recomputed and opened against the root,
+            # no fraud proof): the job is a success, not a failure
+            settled_by_chain = "final job status: Settled" in out and "all correct" in out and "WRONG" not in out
+            if "Accept: Ack { ok: true" not in out and not settled_by_chain:
                 tail = out.strip().splitlines()[-1] if out.strip() else "no answer"
                 return self.finish(j, "failed", "The result could not be accepted: " + tail[:200], audit=audit)
             res = {}
