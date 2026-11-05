@@ -2,7 +2,7 @@
 """ENDURANCE test of a mini-network of REAL processes (4 nodes): miners, an honest worker, a CHEATING worker,
 a relay; a client that randomly submits transfers and jobs of all kinds (product, block-wise, inference,
 tensor program, auction); and CHAOS: abrupt stop (SIGKILL) then restart of random nodes.
-Verdict: (1) the 4 nodes converge to the same tip, (2) the money supply invariant holds on each node,
+Verdict: (1) the 4 nodes converge to the same tip, (2) the money supply invariant holds on node A,
 (3) no process crashed by itself, (4) the cheaters were penalised, the honest ones paid.
 
     python3 tools/soak.py [DURATION_SECONDS=300] [SEED=1]      # after cargo build --release --bins; pip install cryptography
@@ -51,16 +51,16 @@ def addr(seed):
     return bech32m("vrl", bytes.fromhex(C.pub_hex(seed)))
 
 
-def run(*args, check=False, timeout=60):
-    r = subprocess.run([f"{B}/{args[0]}"] + list(args[1:]), capture_output=True, text=True, timeout=timeout)
-    return (r.stdout + r.stderr).strip()
+def run(*args, check=False, timeout=60, stdout_only=False):
+    r = subprocess.run([f"{B}/{args[0]}"] + list(args[1:]), capture_output=True, text=True, timeout=timeout, check=check or stdout_only)
+    return r.stdout.strip() if stdout_only else (r.stdout + r.stderr).strip()
 
 
 # ---------------- genesis ----------------
 alloc = []
 for s in range(1, 7):
     alloc += ["--alloc", f"{addr(s)}=200000"]
-g = run("vearl-genesis", "--network", "soak", "--faucet", addr(7), "--retarget", "Fixed", "--target-divisor", "256", *alloc)
+g = run("vearl-genesis", "--network", "soak", "--faucet", addr(7), "--retarget", "Fixed", "--target-divisor", "256", *alloc, stdout_only=True)
 gj = json.loads(g)
 gj["timing"] = {"challenge_secs": int(os.environ.get("SOAK_WINDOW", 120)), "serve_secs": 15}
 gpath = f"{D}/genesis.json"
@@ -171,9 +171,45 @@ def try_finish(j):
         out = run("vearl-cli", "mlp-finish", HUB, wa, CL, j["id"], "2", s)
     else:
         out = run("vearl-cli", "prog-finish", HUB, wa, CL, j["id"], s, "cnn")
-    j["done"] = True
+    final = re.search(r"final job status: (Settled|Slashed|Expired)\b", out)
+    j["done"] = final is not None
     j["finish"] = out[-200:].replace(chr(10), " | ")
-    stats["finished"] += 1
+    if j["done"]:
+        stats["finished"] += 1
+
+
+def drain_jobs(timeout=240):
+    """Keep verifying late or reorganised results even after the tips converge."""
+    deadline = time.monotonic() + timeout
+    next_report = 0
+    conv, sts = False, {}
+    while time.monotonic() < deadline:
+        for j in jobs:
+            if time.monotonic() >= deadline:
+                return False, sts
+            # A previously settled result can be reorganised away. Read the
+            # canonical state rather than trusting the remembered done flag.
+            m = re.search(r'status: "([A-Za-z]+)', statusline(j))
+            j["done"] = bool(m and m.group(1) in ("Settled", "Slashed", "Expired"))
+            if not j["done"]:
+                try:
+                    try_finish(j)
+                except subprocess.TimeoutExpired:
+                    stats["errors"] += 1
+        states = []
+        for j in jobs:
+            m = re.search(r'status: "([A-Za-z]+)', statusline(j))
+            states.append(m.group(1) if m else "unknown")
+        sts = {n: status(n) for n in NODES}
+        conv = all(sts.values()) and len({s[1] for s in sts.values()}) == 1
+        pending = sum(s not in ("Settled", "Slashed", "Expired") for s in states)
+        if time.monotonic() >= next_report:
+            print(f"[soak] drain: {pending} nonterminal jobs; converged={conv}")
+            next_report = time.monotonic() + 15
+        if conv and not pending:
+            return True, sts
+        time.sleep(2)
+    return False, sts
 
 
 t0 = time.time()
@@ -220,21 +256,16 @@ for nm, p in procs.items():
         print(f"[soak] WARNING: node {nm} stopped by itself (code {p.returncode})")
         stats["errors"] += 1
         start(nm)
-deadline = time.time() + 240
-conv = False
-while time.time() < deadline:
-    sts = {n: status(n) for n in NODES}
-    if all(sts.values()) and len({s[1] for s in sts.values()}) == 1:
-        conv = True
-        break
-    time.sleep(3)
-    for j in [j for j in jobs if not j["done"]]:
-        try_finish(j)
-sts = {n: status(n) for n in NODES}
+# Convergence alone does not finish jobs. Keep verifying late results until
+# every submitted job has a terminal status, with a bounded drain deadline.
+with open(f"{D}/jobs.json", "w") as f:
+    json.dump(jobs, f, indent=2)
+conv, sts = drain_jobs()
+with open(f"{D}/jobs.json", "w") as f:
+    json.dump(jobs, f, indent=2)
 print("[soak] tips:", {n: (s[0] if s else None) for n, s in sts.items()}, "-> CONVERGENCE" if conv else "-> NO CONVERGENCE")
 inv = api_status("A")
 print("[soak] API of node A: money supply invariant ==", inv and inv.get("supply_invariant"), "; supply:", inv and inv.get("supply"))
-time.sleep(70)  # lets the remaining dispute windows close
 summary = {}
 for j in jobs:
     o = statusline(j)
@@ -253,7 +284,11 @@ for p in procs.values():
         p.send_signal(signal.SIGTERM)
     except Exception:
         pass
-ok = conv and (inv is None or inv.get("supply_invariant")) and not crashed
+outcomes_ok = bool(summary) and all(
+    status == ("Slashed" if worker == "cheater" else "Settled")
+    for (_, worker, status) in summary
+)
+ok = conv and inv is not None and inv.get("supply_invariant") is True and not crashed and stats["errors"] == 0 and outcomes_ok
 cheat_slashed = sum(v for (k, w, s), v in summary.items() if w == "cheater" and s == "Slashed")
 honest_paid = sum(v for (k, w, s), v in summary.items() if w == "honest" and s == "Settled")
 print(f"[soak] cheaters penalised: {cheat_slashed}; honest paid: {honest_paid}; tool errors: {stats['errors']}; kills: {stats['kill']}")
