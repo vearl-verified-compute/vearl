@@ -15,7 +15,7 @@ fn main() {
     let t = Instant::now();
     let z = zs[0].as_ref().unwrap();
     let zt = c_tree(z, n);
-    println!("c_tree (Z: {} leaves): {:.3} s", n * n, t.elapsed().as_secs_f64());
+    println!("c_tree (Z: {} leaves): {:.3} s", n, t.elapsed().as_secs_f64());
     let t = Instant::now();
     let ct = cols_tree(&tens[1], n);
     println!("cols_tree (tensor {n} columns): {:.3} s", t.elapsed().as_secs_f64());

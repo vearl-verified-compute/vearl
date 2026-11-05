@@ -238,6 +238,21 @@ fn asert_is_the_default_and_keeps_the_target_on_schedule() {
 }
 
 #[test]
+fn asert_anchors_on_the_first_block_instead_of_the_genesis_timestamp() {
+    let (mut on_time, mut delayed) = (asert_chain(), asert_chain());
+    let initial_target = on_time.target;
+    mine_dt(&mut on_time, BLOCK_TIME);
+    mine_dt(&mut delayed, 4 * ASERT_HALFLIFE);
+    assert_eq!(on_time.target, initial_target);
+    assert_eq!(delayed.target, initial_target, "a late first block keeps the initial target");
+    for dt in [1, BLOCK_TIME, 2 * BLOCK_TIME] {
+        mine_dt(&mut on_time, dt);
+        mine_dt(&mut delayed, dt);
+        assert_eq!(on_time.target, delayed.target, "the same post-anchor schedule gives the same target");
+    }
+}
+
+#[test]
 fn asert_halves_or_doubles_the_target_after_one_halflife_of_drift() {
     // blocks that are too fast (1 s): ahead of schedule, the target drops (harder)
     let mut fast = asert_chain();
