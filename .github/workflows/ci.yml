@@ -37,11 +37,11 @@ jobs:
           # list the failing tests as annotations, so that they are visible without opening the full log
           grep -E "^test .* FAILED$|panicked at|^error(\[|:)" test.log | head -30 | while IFS= read -r line; do echo "::error::${line}"; done
           exit $status
-      # the Python tools (leaderboard, registration processor): they need the `cryptography` package
+      # Python tools and the independent tensor-reference regression tests.
       - name: python tools tests
         if: runner.os == 'Linux'
         run: |
-          pip install cryptography
+          pip install cryptography numpy blake3
           python -m unittest discover -s tools -p "test_*.py"
 
   wallet-gui:
