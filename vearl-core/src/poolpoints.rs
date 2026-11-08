@@ -749,6 +749,7 @@ pub fn audit_pool(cfg: &AuditCfg, inp: &AuditInput) -> AuditReport {
     stats.insert("documents_usable".into(), json!(good.len()));
     stats.insert("pool_blocks_on_chain".into(), json!(chain_pool_blocks));
     stats.insert("shares_recomputed".into(), json!(verified));
+    stats.insert("unknown_parent_shares".into(), json!(unknown_parent));
     stats.insert("receipts_checked".into(), json!(best.len()));
     stats.insert("work_vs_blocks_worst_p".into(), json!(worst_p));
 

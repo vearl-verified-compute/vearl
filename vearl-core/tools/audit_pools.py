@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+from audit_batches import run_batched
 
 SEVERITY = {"ok": 0, "info": 0, "suspect": 1, "fraud": 2}
 # the work-versus-blocks test (a Poisson test) assumes that the difficulty of the blocks is about the same all day long. When the chain's target moves by
@@ -189,7 +190,10 @@ def main():
     ap.add_argument("--audit-arg", action="append", default=[], help="extra argument for vearl-pool-audit (repeat), e.g. --audit-arg=--verify-max --audit-arg=500")
     ap.add_argument("--receipts-dir", help="folder of pool-receipts*.jsonl files kept by miners (more evidence for the audit)")
     ap.add_argument("--waivers", default=DEFAULT_WAIVERS, help="optional file of findings that the project accepts (hour by hour, never a fraud), see apply_waivers")
+    ap.add_argument("--batch-epochs", type=int, default=16, help="share epochs recomputed per process; budget-exhausted batches are split again")
     a = ap.parse_args()
+    if a.batch_epochs < 1:
+        ap.error("--batch-epochs must be positive")
     base = os.path.dirname(os.path.abspath(a.spec))
     here = os.path.dirname(os.path.abspath(__file__))
     with open(a.spec, encoding="utf-8") as f:
@@ -210,25 +214,17 @@ def main():
         if a.receipts_dir:
             for rf in sorted(glob.glob(os.path.join(a.receipts_dir, "*.jsonl"))):
                 cmd += ["--receipts", rf]
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        print(r.stdout.strip())
-        if r.returncode in (0, 1, 2):
-            days = relax_target_ramp(report, a.blocks)
-            if days:
-                print(f"{p.get('name', p['address'])}: work-versus-blocks test not applicable on day(s) {days} (the chain's target moved by more than x{TARGET_RAMP:.0f}); verdict recomputed")
-            waived = apply_waivers(report, a.waivers, p["address"])
-            if waived:
-                print(f"{p.get('name', p['address'])}: {len(waived)} finding(s) accepted by the project (waivers): {waived}; verdict recomputed")
-            days = relax_stale_loss(report)
-            if days:
-                print(f"{p.get('name', p['address'])}: work-versus-blocks test on day(s) {days}: the claimed work is plausible once {100 * STALE_ALLOWANCE:.0f} % of it is allowed to be lost to stale jobs; verdict recomputed")
-        if r.returncode not in (0, 1, 2):
-            # A pool must not be able to escape its audit by feeding it data that breaks it: a failed audit leaves a report that holds every hour
-            # (the epochs are not listed as ok), instead of leaving the previous, favourable report in force.
-            print(f"{p.get('name', p['address'])}: the audit program failed: {r.stderr.strip()[:300]}")
-            with open(report, "w", encoding="utf-8", newline="\n") as f:
-                json.dump({"proto": "vpool-audit/1", "pool": p["address"], "verdict": "suspect", "epochs": {}, "stats": {},
-                           "findings": [{"epoch": None, "severity": "suspect", "code": "audit_failed", "detail": "the audit program failed on this pool's data"}]}, f)
+        merged = run_batched(cmd, bundle, report, p["address"], a.batch_epochs)
+        print(f"{p.get('name', p['address'])}: {merged['verdict']}")
+        days = relax_target_ramp(report, a.blocks)
+        if days:
+            print(f"{p.get('name', p['address'])}: work-versus-blocks test not applicable on day(s) {days} (the chain's target moved by more than x{TARGET_RAMP:.0f}); verdict recomputed")
+        waived = apply_waivers(report, a.waivers, p["address"])
+        if waived:
+            print(f"{p.get('name', p['address'])}: {len(waived)} finding(s) accepted by the project (waivers): {waived}; verdict recomputed")
+        days = relax_stale_loss(report)
+        if days:
+            print(f"{p.get('name', p['address'])}: work-versus-blocks test on day(s) {days}: the claimed work is plausible once {100 * STALE_ALLOWANCE:.0f} % of it is allowed to be lost to stale jobs; verdict recomputed")
 
 
 if __name__ == "__main__":

@@ -629,3 +629,77 @@ fn the_page_of_the_pool_escapes_what_comes_from_the_api() {
     assert!(page.contains("X(m.points.official.reasons.join"));
     assert!(page.contains("X(w.worker)"));
 }
+
+/// Batching only samples keeps full-history document checks while resetting the per-process budget.
+#[test]
+fn share_batches_complete_without_waiving_the_matrix_budget() {
+    let sk = SigningKey::from_bytes(&[5; 32]);
+    let g = genesis_hash(&genesis());
+    let mut cfg = AuditCfg::new(pubkey(&sk), g, genesis().params, 4_000_000_000);
+    cfg.p_suspect = 0.0;
+    cfg.max_matrix_builds = 1;
+    let mut inp = AuditInput::default();
+    let mut previous = ZERO_HASH;
+    for i in 0..2u64 {
+        let epoch = 1_000_000 + i;
+        let job = JobRec { prev: [1; 32], height: i * vearl_core::state::EPOCH_LEN + 5,
+            timestamp: epoch * 3600 + 10, tx_root: [2; 32], target: u64::MAX, native_epoch: i };
+        let rec = ShareRec { addr: pubkey(&SigningKey::from_bytes(&[9; 32])), job: 0,
+            extra_nonce: 1, ti: 0, tj: 0, target: u64::MAX, v2: true };
+        let doc = build_doc(&sk, &g, &previous, &EpochData { epoch, epoch_secs: 3600,
+            fee_bps: 0, blocks: &[], jobs: &[job], records: &[rec.clone()] });
+        previous = unhex32(&doc_hash(&doc)).unwrap();
+        inp.docs.insert(epoch, doc);
+        inp.samples.insert(epoch, Samples::Full(vec![rec]));
+    }
+    let whole = audit_pool(&cfg, &inp);
+    assert!(whole.has("audit_budget"));
+    let samples = std::mem::take(&mut inp.samples);
+    let dir = std::env::temp_dir().join(format!("vpool-batches-{}", rand::random::<u32>()));
+    let bundle = dir.join("bundle");
+    std::fs::create_dir_all(&bundle).unwrap();
+    for (epoch, doc) in &inp.docs {
+        std::fs::write(bundle.join(format!("epoch-{epoch}.json")), serde_json::to_vec(doc).unwrap()).unwrap();
+    }
+    for (epoch, sample) in &samples {
+        if let Samples::Full(recs) = sample {
+            let json = serde_json::json!({"records": recs.iter().map(|r| hex(&r.bytes())).collect::<Vec<_>>()});
+            std::fs::write(bundle.join(format!("shares-{epoch}.json")), serde_json::to_vec(&json).unwrap()).unwrap();
+        }
+    }
+    std::fs::write(dir.join("genesis.json"), vearl_core::genesis::genesis_to_json("test", &genesis())).unwrap();
+    let mut verified = 0;
+    for (epoch, sample) in samples {
+        inp.samples.clear();
+        inp.samples.insert(epoch, sample);
+        let batch = audit_pool(&cfg, &inp);
+        assert!(!batch.has("audit_budget"), "{:?}", codes(&batch));
+        assert_eq!(batch.stats["documents"], 2);
+        assert_eq!(batch.stats["documents_usable"], 2);
+        assert_eq!(batch.stats["unknown_parent_shares"], 0);
+        assert!(batch.verdict < Severity::Suspect, "{:?}", codes(&batch));
+        verified += batch.stats["shares_recomputed"].as_u64().unwrap();
+    }
+    assert_eq!(verified, 2);
+    // Exercise the real CLI and Python orchestrator, including budget-triggered retry.
+    let script = r#"
+import sys
+from pathlib import Path
+from audit_batches import run_batched
+root = Path(sys.argv[2])
+cmd = [sys.argv[1], '--bundle', str(root/'bundle'), '--out', str(root/'audit.json'),
+       '--genesis', str(root/'genesis.json'), '--pool', sys.argv[3], '--p-suspect', '0',
+       '--now', '4000000000', '--matrix-builds', '1']
+r = run_batched(cmd, root/'bundle', root/'audit.json', sys.argv[3], batch_size=2)
+assert r['verdict'] == 'ok', r
+assert r['stats']['shares_recomputed'] == 2, r
+assert r['stats']['share_batches'] == 2, r
+assert set(r['epochs'].values()) == {'ok'}, r
+"#;
+    let result = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
+        .args(["-c", script, env!("CARGO_BIN_EXE_vearl-pool-audit"), dir.to_str().unwrap(), &address_of(&pubkey(&sk))])
+        .env("PYTHONPATH", std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tools"))
+        .output().unwrap();
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    let _ = std::fs::remove_dir_all(dir);
+}

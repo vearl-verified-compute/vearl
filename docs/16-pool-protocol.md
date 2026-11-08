@@ -367,3 +367,28 @@ days), times the share of the `vpool/2` work that the address did that day.
   before it are not counted.
 - A miner that speaks `vpool/1`, or an address that never mined in this pool, has 0 points here: there are no receipts to back its work.
 - The two figures are written independently (Rust in the pool, Python in the rewards tool) and the tests check that they agree.
+
+### Auditing growing histories without exhausting the matrix budget
+
+`tools/audit_pools.py` recomputes shares in batches of 16 hourly epochs by default
+(`--batch-epochs N`). Each process still reads **all** signed epoch documents,
+first-seen times, receipts and the same frozen chain snapshot: document chaining,
+hidden blocks, work-versus-blocks checks and receipt contradictions are not split
+into isolated windows. Only share/proof files are partitioned. A batch that reaches
+`audit_budget` is retried in halves; a single epoch that still exceeds the budget
+remains held. Neither an exhausted budget nor a process failure is waived.
+
+Install `audit_batches.py` alongside `audit_pools.py` and rebuild/install
+`vearl-pool-audit` from the same revision. The merger requires the audit binary's
+`unknown_parent_shares` counter to recheck that statistical threshold across all
+batches; an older binary fails closed. The CLI also accepts `--matrix-builds N`
+for a smaller per-process budget (1 through 400, never above the default).
+
+The final report is replaced atomically only after complete share coverage. Fraud
+findings survive merging, including when another batch fails. Existing project
+waivers and documented statistical relaxations run afterward as before. Initial
+re-auditing of a long history can take substantially longer than an exhausted
+single pass; this is bounded recomputation per process, not incremental reuse of
+previous audits. Test runtime/resource use on the operator's host before changing
+the production schedule. Do not restore credit by enabling unaudited counting or
+removing resource guards.
