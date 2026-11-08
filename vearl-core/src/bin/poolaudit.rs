@@ -1,7 +1,7 @@
 //! vearl-pool-audit: checks what a mining pool published, against the chain and against the receipts its miners hold (docs/16 section 13).
 //!
 //! vearl-pool-audit --bundle DIR --genesis genesis.json --pool vrl1... [--blocks blocks.json] [--receipts FILE]... [--out audit.json]
-//!                  [--now UNIX] [--deadline-hours 24] [--verify-max 64] [--p-suspect 1e-9] [--epoch-secs 3600]...
+//!                  [--now UNIX] [--deadline-hours 24] [--verify-max 64] [--p-suspect 1e-9] [--epoch-secs 3600]... [--matrix-builds 400]
 //!
 //! DIR is made by `tools/fetch_pool_bundle.py` (the epoch documents, and the shares drawn after the documents were published):
 //!   epoch-<E>.json   signed document of an epoch
@@ -52,7 +52,7 @@ fn main() {
     let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let all = |name: &str| -> Vec<String> { args.iter().enumerate().filter(|(_, a)| *a == name).filter_map(|(i, _)| args.get(i + 1).cloned()).collect() };
     for a in &args {
-        if a.starts_with("--") && !["--bundle", "--genesis", "--pool", "--blocks", "--receipts", "--out", "--now", "--deadline-hours", "--verify-max", "--p-suspect", "--epoch-secs", "--max-lag-hours"].contains(&a.as_str()) {
+        if a.starts_with("--") && !["--bundle", "--genesis", "--pool", "--blocks", "--receipts", "--out", "--now", "--deadline-hours", "--verify-max", "--p-suspect", "--epoch-secs", "--max-lag-hours", "--matrix-builds"].contains(&a.as_str()) {
             die(&format!("unknown option: {a}"));
         }
     }
@@ -70,6 +70,13 @@ fn main() {
     }
     if let Some(v) = arg("--verify-max") {
         cfg.verify_max = v.parse().unwrap_or_else(|_| die("--verify-max: integer"));
+    }
+    if let Some(value) = arg("--matrix-builds") {
+        let limit: usize = value.parse().unwrap_or_else(|_| die("--matrix-builds: integer"));
+        if limit == 0 || limit > cfg.max_matrix_builds {
+            die("--matrix-builds: between 1 and the default budget (400)");
+        }
+        cfg.max_matrix_builds = limit;
     }
     let lens = all("--epoch-secs");
     if !lens.is_empty() {
